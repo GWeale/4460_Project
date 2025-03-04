@@ -13,12 +13,14 @@ def create_anndata():
     adata = AnnData(protein_data, obs=obs)
     adata.uns['metadata'] = metadata
     # for each patient,  normalize the protein data and log1p transform
+    overall_survival = metadata['OS'].values
+    os_binary = (overall_survival<np.mean(overall_survival)).astype(int).astype(str)
+    os_dict = {x:y for x,y in zip(metadata['donor'],os_binary)}
+    adata.obs['os_binary'] = None
     for donor in adata.obs['donor'].unique():
         mask = adata.obs['donor'] == donor
+        adata.obs['os_binary'][mask] = os_dict[donor]
         sc.pp.normalize_total(adata[mask])
         sc.pp.log1p(adata[mask])
     adata.write('protein_data.h5ad')
-    overall_survival = metadata['OS']
-    os_binary = overall_survival<np.mean(overall_survival)
-    adata.obs['os_binary'] = os_binary
     return adata
