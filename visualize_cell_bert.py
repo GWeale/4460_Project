@@ -6,6 +6,7 @@ Cell-BERT Model Visualization
 This script visualizes the results of the Cell-BERT model for melanoma survival prediction.
 """
 
+import os
 import torch
 import numpy as np
 import pandas as pd
@@ -21,397 +22,549 @@ import torch.nn.functional as F
 from sklearn.neighbors import NearestNeighbors
 
 # Import our model
-from cell_bert_model import CellBERTModel, WindowAggregator, CellWindowDataset
+from cell_bert_model import (
+    LightCellBERTModel, WindowAggregator, CellWindowDataset, 
+    create_anndata_from_csv
+)
 
 
-def load_data(data_path='protein_data.h5ad'):
-    """Load and print basic information about the data"""
-    print("1. Loading Data")
-    adata = sc.read(data_path)
-    print(f"Data shape: {adata.shape}")
-    print(f"Number of patients: {len(adata.obs['donor'].unique())}")
+def load_data(melanoma_data='Melanoma_data.csv', 
+              markers_data='Day3_Markers_Dryad.csv',
+              metadata='metadata.csv',
+              sample_ratio=0.02):
+    """
+    Load data from CSV files and create an AnnData object.
+    
+    Args:
+        melanoma_data: Path to melanoma data CSV
+        markers_data: Path to markers data CSV
+        metadata: Path to metadata CSV
+        sample_ratio: Ratio of cells to sample (to reduce memory usage)
+    
+    Returns:
+        AnnData object containing the data
+    """
+    print(f"Loading data from CSV files:")
+    print(f"  - Melanoma data: {melanoma_data}")
+    print(f"  - Markers data: {markers_data}")
+    print(f"  - Metadata: {metadata}")
+    
+    # Create AnnData from CSV files with a small sample ratio for visualization
+    adata = create_anndata_from_csv(
+        melanoma_data,
+        markers_data,
+        metadata,
+        sample_ratio=sample_ratio
+    )
+    
+    print(f"Data shape: {adata.X.shape} cells, {adata.X.shape[1]} features")
+    print(f"Number of patients: {len(adata.obs['patient_id'].unique())}")
+    
     return adata
 
 
-def visualize_patient_distributions(adata):
-    """Visualize patient survival distribution"""
-    print("\n2. Visualizing Patient Distributions")
-    # Extract metadata
-    metadata = adata.uns['metadata']
+def visualize_patient_distribution(adata, output_path="patient_survival_distribution.png"):
+    """
+    Visualize the distribution of patient survival times.
     
-    # Plot survival distribution
+    Args:
+        adata: AnnData object containing patient metadata
+        output_path: Path to save the visualization
+    """
     plt.figure(figsize=(10, 6))
-    sns.histplot(metadata['OS'], bins=15, kde=True)
-    plt.axvline(x=24, color='red', linestyle='--', label='Survival Threshold (24 months)')
-    plt.title('Overall Survival Distribution')
-    plt.xlabel('Overall Survival (months)')
-    plt.ylabel('Frequency')
-    plt.legend()
-    plt.savefig('survival_distribution.png')
+    
+    # Get unique patients and their survival times
+    patients = adata.obs[['patient_id', 'overall_survival']].drop_duplicates()
+    
+    # Create a histogram of survival times
+    sns.histplot(patients['overall_survival'], bins=20, kde=True)
+    plt.xlabel('Overall Survival Time (months)')
+    plt.ylabel('Number of Patients')
+    plt.title('Distribution of Patient Survival Times')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
     plt.close()
-    print("Saved 'survival_distribution.png'")
-
-
-def visualize_spatial_distribution(adata):
-    """Visualize spatial distribution of cells for a sample patient"""
-    print("\n3. Visualizing Spatial Distribution of Cells")
-    # Select a sample patient
-    sample_patient = adata.obs['donor'].unique()[0]
-    patient_mask = adata.obs['donor'] == sample_patient
-    patient_data = adata[patient_mask]
     
-    # Plot cell spatial distribution
-    plt.figure(figsize=(10, 10))
-    plt.scatter(patient_data.obs['X'], patient_data.obs['Y'], alpha=0.5, s=10)
-    plt.title(f'Spatial Distribution of Cells for Patient {sample_patient}')
-    plt.xlabel('X coordinate')
-    plt.ylabel('Y coordinate')
-    plt.gca().set_aspect('equal')
-    plt.savefig('spatial_distribution.png')
+    print(f"Patient survival distribution saved to {output_path}")
+    
+    # Print some basic statistics
+    print(f"Survival time statistics:")
+    print(f"  Mean: {patients['overall_survival'].mean():.1f} months")
+    print(f"  Median: {patients['overall_survival'].median():.1f} months")
+    print(f"  Min: {patients['overall_survival'].min():.1f} months")
+    print(f"  Max: {patients['overall_survival'].max():.1f} months")
+
+
+def visualize_spatial_distribution(adata, patient_id=None, output_path="spatial_distribution.png"):
+    """
+    Visualize the spatial distribution of cells for a patient.
+    
+    Args:
+        adata: AnnData object containing cell data
+        patient_id: ID of the patient to visualize (if None, selects the first patient)
+        output_path: Path to save the visualization
+    """
+    if patient_id is None:
+        # Get the first patient with a reasonable number of cells
+        patients = adata.obs['patient_id'].value_counts()
+        for pid, count in patients.items():
+            if count > 100:
+                patient_id = pid
+                break
+    
+    # Filter data for the selected patient
+    patient_data = adata[adata.obs['patient_id'] == patient_id]
+    
+    if len(patient_data) == 0:
+        print(f"No data found for patient {patient_id}")
+        return
+    
+    print(f"Visualizing spatial distribution for patient {patient_id} with {len(patient_data)} cells")
+    
+    plt.figure(figsize=(10, 8))
+    
+    # Get cell coordinates
+    x_coords = patient_data.obs['x_coordinate'].values
+    y_coords = patient_data.obs['y_coordinate'].values
+    
+    # Create a scatter plot of cell positions
+    plt.scatter(x_coords, y_coords, s=10, alpha=0.7)
+    plt.xlabel('X Coordinate')
+    plt.ylabel('Y Coordinate')
+    plt.title(f'Spatial Distribution of Cells for Patient {patient_id}')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
     plt.close()
-    print("Saved 'spatial_distribution.png'")
     
-    return patient_data
+    print(f"Spatial distribution visualization saved to {output_path}")
 
 
-def visualize_cell_neighborhoods(patient_data, window_size=15):
-    """Visualize cell neighborhoods using nearest neighbors"""
-    print("\n4. Visualizing Cell Neighborhoods")
-    # Extract coordinates for the patient
-    coords = np.column_stack([patient_data.obs['X'].values, patient_data.obs['Y'].values])
+def visualize_cell_neighborhood(adata, window_size=10, patient_id=None, 
+                               output_path="cell_neighborhood.png"):
+    """
+    Visualize a typical cell neighborhood (window) used by the model.
     
-    # Find nearest neighbors
-    nn_finder = NearestNeighbors(n_neighbors=window_size)
-    nn_finder.fit(coords)
-    distances, indices = nn_finder.kneighbors(coords)
+    Args:
+        adata: AnnData object containing cell data
+        window_size: Number of cells in each neighborhood
+        patient_id: ID of the patient to visualize (if None, selects the first patient)
+        output_path: Path to save the visualization
+    """
+    if patient_id is None:
+        # Get the first patient with a reasonable number of cells
+        patients = adata.obs['patient_id'].value_counts()
+        for pid, count in patients.items():
+            if count > window_size * 2:
+                patient_id = pid
+                break
     
-    # Select a random cell
-    np.random.seed(42)
-    random_cell_idx = np.random.randint(0, len(coords))
-    neighbor_indices = indices[random_cell_idx]
+    # Filter data for the selected patient
+    patient_data = adata[adata.obs['patient_id'] == patient_id]
     
-    # Plot the neighborhood
-    plt.figure(figsize=(10, 10))
-    plt.scatter(coords[:, 0], coords[:, 1], alpha=0.1, s=10, color='lightgray')
-    plt.scatter(coords[neighbor_indices, 0], coords[neighbor_indices, 1], alpha=0.8, s=40, color='blue')
-    plt.scatter(coords[random_cell_idx, 0], coords[random_cell_idx, 1], alpha=1.0, s=100, color='red')
+    if len(patient_data) < window_size:
+        print(f"Not enough cells for patient {patient_id} to visualize a neighborhood")
+        return
+    
+    # Get coordinates for all cells
+    all_coords = np.vstack([
+        patient_data.obs['x_coordinate'].values,
+        patient_data.obs['y_coordinate'].values
+    ]).T
+    
+    # Select a random central cell
+    center_idx = np.random.randint(0, len(patient_data))
+    center_x, center_y = all_coords[center_idx]
+    
+    # Calculate distances from the central cell to all other cells
+    distances = np.sqrt(np.sum((all_coords - np.array([center_x, center_y])) ** 2, axis=1))
+    
+    # Find the window_size nearest neighbors
+    nearest_indices = np.argsort(distances)[:window_size]
+    
+    # Create a visualization of the neighborhood
+    plt.figure(figsize=(8, 8))
+    
+    # Plot all cells in the patient
+    plt.scatter(all_coords[:, 0], all_coords[:, 1], s=5, color='lightgray', alpha=0.4, label='Other cells')
+    
+    # Highlight the window cells
+    window_coords = all_coords[nearest_indices]
+    plt.scatter(window_coords[:, 0], window_coords[:, 1], s=30, color='blue', alpha=0.7, label='Window cells')
+    
+    # Highlight the central cell
+    plt.scatter(center_x, center_y, s=80, color='red', marker='*', label='Central cell')
+    
+    # Draw lines from the central cell to each neighbor
+    for i in range(1, len(nearest_indices)):
+        x, y = window_coords[i]
+        plt.plot([center_x, x], [center_y, y], 'k-', alpha=0.2)
+    
+    plt.xlabel('X Coordinate')
+    plt.ylabel('Y Coordinate')
     plt.title(f'Cell Neighborhood (Window Size = {window_size})')
-    plt.xlabel('X coordinate')
-    plt.ylabel('Y coordinate')
-    plt.gca().set_aspect('equal')
-    plt.savefig('cell_neighborhood.png')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
     plt.close()
-    print("Saved 'cell_neighborhood.png'")
+    
+    print(f"Cell neighborhood visualization saved to {output_path}")
 
 
-def create_and_load_model(adata, window_size=15, survival_threshold=24, batch_size=32):
-    """Create and optionally load pre-trained Cell-BERT model"""
-    print("\n5. Creating and Loading Model")
-    # Create datasets
-    dataset = CellWindowDataset(adata, window_size=window_size, 
-                                survival_threshold=survival_threshold)
+def create_or_load_model(adata, embedding_dim=64, model_path=None, aggregator_path=None):
+    """
+    Create a new model or load a pre-trained model.
     
-    # Split data
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
-    print(f"Total windows: {len(dataset)}")
-    print(f"Training windows: {len(train_dataset)}")
-    print(f"Validation windows: {len(val_dataset)}")
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    # Create models
-    cell_feature_dim = adata.X.shape[1]  # Number of protein markers
-    d_model = 128  # Embedding dimension
-    
-    cell_bert_model = CellBERTModel(cell_feature_dim, d_model=d_model, 
-                                   num_heads=4, dim_feedforward=256, 
-                                   num_layers=3, dropout=0.1)
-    
-    window_aggregator = WindowAggregator(d_model, hidden_dim=64)
+    Args:
+        adata: AnnData object to determine feature dimensions
+        embedding_dim: Dimension of embeddings
+        model_path: Path to pre-trained model (optional)
+        aggregator_path: Path to pre-trained aggregator (optional)
+        
+    Returns:
+        cell_bert_model: The BERT-style model
+        window_aggregator: The window aggregation model
+        device: The device to run the model on
+    """
+    # Determine cell feature dimension from the data
+    cell_feature_dim = adata.X.shape[1]
     
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Optional: Load pre-trained models if available
-    try:
-        cell_bert_model.load_state_dict(torch.load('cell_bert_model.pt'))
-        window_aggregator.load_state_dict(torch.load('window_aggregator.pt'))
-        print("Loaded pre-trained models")
-    except FileNotFoundError:
-        print("No pre-trained models found. Will need to train from scratch.")
+    # Create lightweight models
+    print("Creating lightweight Cell-BERT model")
+    cell_bert_model = LightCellBERTModel(
+        cell_feature_dim, 
+        d_model=embedding_dim,
+        num_heads=2,
+        dim_feedforward=embedding_dim * 2,
+        num_layers=2
+    )
+    
+    window_aggregator = WindowAggregator(embedding_dim, hidden_dim=embedding_dim // 2)
+    
+    # Try to load pre-trained models if specified
+    if model_path and os.path.exists(model_path):
+        try:
+            print(f"Loading pre-trained model from {model_path}")
+            cell_bert_model.load_state_dict(torch.load(model_path, map_location=device))
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            print("Using untrained model instead")
+    else:
+        print("Using untrained model (no pre-trained model specified or found)")
+    
+    if aggregator_path and os.path.exists(aggregator_path):
+        try:
+            print(f"Loading pre-trained aggregator from {aggregator_path}")
+            window_aggregator.load_state_dict(torch.load(aggregator_path, map_location=device))
+        except Exception as e:
+            print(f"Error loading aggregator: {e}")
+            print("Using untrained aggregator instead")
+    else:
+        print("Using untrained aggregator (no pre-trained aggregator specified or found)")
     
     cell_bert_model = cell_bert_model.to(device)
     window_aggregator = window_aggregator.to(device)
     
-    return cell_bert_model, window_aggregator, train_loader, val_loader, device
+    return cell_bert_model, window_aggregator, device
 
 
-def extract_cell_embeddings(model, loader, device):
-    """Extract CLS token embeddings from the model"""
-    model.eval()
-    all_embeddings = []
-    all_labels = []
-    all_patient_ids = []
+def visualize_embeddings(adata, cell_bert_model, device, window_size=10, max_windows=50,
+                         output_path_prefix="embedding"):
+    """
+    Extract CLS token embeddings for cells and visualize using PCA and t-SNE.
+    
+    Args:
+        adata: AnnData object containing cell data
+        cell_bert_model: The BERT-style model to extract embeddings
+        device: Device to run the model on
+        window_size: Number of cells in each window
+        max_windows: Maximum number of windows per patient for memory efficiency
+        output_path_prefix: Prefix for output files
+    """
+    print("Creating dataset for embedding visualization")
+    dataset = CellWindowDataset(adata, window_size=window_size, 
+                              survival_threshold=24, 
+                              max_windows_per_patient=max_windows)
+    
+    loader = DataLoader(dataset, batch_size=32, shuffle=False)
+    
+    print(f"Extracting embeddings from {len(dataset)} windows")
+    
+    # Extract CLS token embeddings
+    cell_bert_model.eval()
+    cls_embeddings = []
+    window_labels = []
+    patient_ids = []
     
     with torch.no_grad():
-        for batch in tqdm(loader):
+        for batch in loader:
             features = batch['features'].to(device)
             x_coords = batch['x_coords'].to(device)
             y_coords = batch['y_coords'].to(device)
-            labels = batch['label'].squeeze().numpy()
-            patient_ids = batch['patient_id']
+            labels = batch['label'].cpu().numpy()
+            p_ids = batch['patient_id']
             
-            cls_output, _ = model(features, x_coords, y_coords)
+            # Forward pass to get CLS embeddings
+            cls_outputs, _ = cell_bert_model(features, x_coords, y_coords)
             
-            all_embeddings.append(cls_output.cpu().numpy())
-            all_labels.extend(labels)
-            all_patient_ids.extend(patient_ids)
+            cls_embeddings.append(cls_outputs.cpu().numpy())
+            window_labels.append(labels)
+            patient_ids.extend(p_ids)
     
-    return np.vstack(all_embeddings), np.array(all_labels), np.array(all_patient_ids)
-
-
-def visualize_embeddings(cell_bert_model, val_loader, device):
-    """Visualize embeddings using PCA and t-SNE"""
-    print("\n6. Extracting and Visualizing Cell Embeddings")
+    # Combine results
+    cls_embeddings = np.vstack(cls_embeddings)
+    window_labels = np.concatenate(window_labels)
     
-    # Extract embeddings from validation set
-    embeddings, labels, patient_ids = extract_cell_embeddings(cell_bert_model, val_loader, device)
-    print(f"Extracted {len(embeddings)} embeddings")
+    print(f"Generated {cls_embeddings.shape[0]} embeddings")
     
-    # Visualize embeddings using PCA
+    # Create PCA visualization
+    print("Applying PCA to reduce embedding dimensions")
     pca = PCA(n_components=2)
-    pca_result = pca.fit_transform(embeddings)
+    embeddings_pca = pca.fit_transform(cls_embeddings)
     
-    plt.figure(figsize=(12, 10))
-    for label in np.unique(labels):
-        mask = labels == label
-        plt.scatter(pca_result[mask, 0], pca_result[mask, 1], alpha=0.5, 
-                    label=f"{'Long Survival' if label == 1 else 'Short Survival'}")
-    
-    plt.title('PCA of CLS Token Embeddings')
-    plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-    plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.savefig('pca_embeddings.png')
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(embeddings_pca[:, 0], embeddings_pca[:, 1], c=window_labels, 
+                         cmap='coolwarm', alpha=0.7, s=30)
+    plt.colorbar(scatter, label='Survival Category')
+    plt.xlabel('PCA Component 1')
+    plt.ylabel('PCA Component 2')
+    plt.title('PCA of Cell-BERT CLS Token Embeddings')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{output_path_prefix}_pca.png")
     plt.close()
-    print("Saved 'pca_embeddings.png'")
     
-    # Visualize embeddings using t-SNE
-    tsne = TSNE(n_components=2, random_state=42)
-    tsne_result = tsne.fit_transform(embeddings)
+    print(f"PCA visualization saved to {output_path_prefix}_pca.png")
     
-    plt.figure(figsize=(12, 10))
-    for label in np.unique(labels):
-        mask = labels == label
-        plt.scatter(tsne_result[mask, 0], tsne_result[mask, 1], alpha=0.5, 
-                    label=f"{'Long Survival' if label == 1 else 'Short Survival'}")
+    # Create t-SNE visualization (can be slow for large datasets)
+    if cls_embeddings.shape[0] > 5000:
+        print("Too many points for t-SNE, sampling 5000 points")
+        indices = np.random.choice(cls_embeddings.shape[0], 5000, replace=False)
+        embeddings_sample = cls_embeddings[indices]
+        labels_sample = window_labels[indices]
+    else:
+        embeddings_sample = cls_embeddings
+        labels_sample = window_labels
     
-    plt.title('t-SNE of CLS Token Embeddings')
-    plt.xlabel('t-SNE dimension 1')
-    plt.ylabel('t-SNE dimension 2')
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.savefig('tsne_embeddings.png')
+    print("Applying t-SNE to reduce embedding dimensions (this may take a while)")
+    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000)
+    embeddings_tsne = tsne.fit_transform(embeddings_sample)
+    
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(embeddings_tsne[:, 0], embeddings_tsne[:, 1], c=labels_sample, 
+                         cmap='coolwarm', alpha=0.7, s=30)
+    plt.colorbar(scatter, label='Survival Category')
+    plt.xlabel('t-SNE Component 1')
+    plt.ylabel('t-SNE Component 2')
+    plt.title('t-SNE of Cell-BERT CLS Token Embeddings')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f"{output_path_prefix}_tsne.png")
     plt.close()
-    print("Saved 'tsne_embeddings.png'")
+    
+    print(f"t-SNE visualization saved to {output_path_prefix}_tsne.png")
 
 
-def get_attention_weights(model, cell_features, x_coords, y_coords):
-    """Get attention weights for a sample window"""
-    model.eval()
+def visualize_attention(adata, cell_bert_model, device, window_size=10, 
+                        output_path="attention_pattern.png"):
+    """
+    Visualize attention patterns from the transformer model.
+    Shows how the CLS token attends to different cells in a window.
+    
+    Args:
+        adata: AnnData object containing cell data
+        cell_bert_model: The BERT-style model
+        device: Device to run the model on
+        window_size: Number of cells in each window
+        output_path: Path to save the visualization
+    """
+    print("Creating dataset for attention visualization")
+    dataset = CellWindowDataset(adata, window_size=window_size, 
+                              survival_threshold=24,
+                              max_windows_per_patient=10)  # Just need a few windows
+    
+    if len(dataset) == 0:
+        print("No data available for attention visualization")
+        return
+    
+    # Get a single batch
+    sample_idx = np.random.randint(0, len(dataset))
+    sample = dataset[sample_idx]
+    
+    batch = {
+        'features': sample['features'].unsqueeze(0).to(device),
+        'x_coords': sample['x_coords'].unsqueeze(0).to(device),
+        'y_coords': sample['y_coords'].unsqueeze(0).to(device),
+        'patient_id': [sample['patient_id']]
+    }
+    
+    # Get attention maps from the model
+    cell_bert_model.eval()
     with torch.no_grad():
-        # Get feature embedding
-        batch_size, num_cells, _ = cell_features.size()
-        embeddings = model.feature_embedding(cell_features)
-        
-        # Compute positional embeddings for each cell
-        pos_embeddings = torch.zeros_like(embeddings)
-        for i in range(batch_size):
-            for j in range(num_cells):
-                pos_embeddings[i, j] = model.pos_encoding(x_coords[i, j].unsqueeze(0), 
-                                                         y_coords[i, j].unsqueeze(0))
-        
-        # Compute cell type embeddings
-        cell_type_embeddings = model.cell_type_embedding(cell_features)
-        
-        # Combine embeddings
-        embeddings = embeddings + pos_embeddings + cell_type_embeddings
-        
-        # Add CLS token
-        cls_tokens = model.cls_token.repeat(batch_size, 1, 1)
-        embeddings = torch.cat([cls_tokens, embeddings], dim=1)
-        
-        # Get attention weights from the first layer
-        transformer_block = model.transformer_blocks[0]
-        q = transformer_block.attention.q_linear(embeddings)
-        k = transformer_block.attention.k_linear(embeddings)
-        
-        # Reshape for multi-head attention
-        head_dim = transformer_block.attention.head_dim
-        num_heads = transformer_block.attention.num_heads
-        
-        q = q.view(batch_size, -1, num_heads, head_dim).transpose(1, 2)
-        k = k.view(batch_size, -1, num_heads, head_dim).transpose(1, 2)
-        
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        attention_weights = F.softmax(scores, dim=-1)
-        
-        return attention_weights
-
-
-def visualize_attention_patterns(cell_bert_model, val_loader, device):
-    """Visualize attention patterns in the model"""
-    print("\n7. Visualizing Attention Patterns")
+        _, attn_maps = cell_bert_model(
+            batch['features'], 
+            batch['x_coords'], 
+            batch['y_coords'],
+            return_attention=True
+        )
     
-    # Get a sample batch
-    sample_batch = next(iter(val_loader))
-    sample_features = sample_batch['features'].to(device)
-    sample_x_coords = sample_batch['x_coords'].to(device)
-    sample_y_coords = sample_batch['y_coords'].to(device)
+    # Take the last layer's attention map
+    last_layer_attn = attn_maps[-1][0]  # Shape: [num_heads, seq_len, seq_len]
     
-    # Get attention weights
-    attention_weights = get_attention_weights(cell_bert_model, sample_features, sample_x_coords, sample_y_coords)
+    # Visualize how the CLS token (index 0) attends to other tokens
+    cls_attention = last_layer_attn[:, 0, 1:].cpu().numpy()  # Shape: [num_heads, window_size]
     
-    # Visualize attention for the first sample in the batch and first attention head
-    sample_idx = 0
-    head_idx = 0
-    
-    plt.figure(figsize=(12, 10))
-    plt.imshow(attention_weights[sample_idx, head_idx].cpu().numpy(), cmap='viridis')
-    plt.colorbar()
-    plt.title(f'Attention Weights (Head {head_idx})')
-    plt.xlabel('Token Position')
-    plt.ylabel('Token Position')
-    plt.savefig('attention_weights.png')
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(cls_attention, cmap='viridis', 
+               xticklabels=[f'Cell {i+1}' for i in range(window_size)],
+               yticklabels=[f'Head {i+1}' for i in range(cls_attention.shape[0])])
+    plt.xlabel('Cell Position in Window')
+    plt.ylabel('Attention Head')
+    plt.title('Attention from CLS Token to Cells')
+    plt.tight_layout()
+    plt.savefig(output_path)
     plt.close()
-    print("Saved 'attention_weights.png'")
     
-    # Visualize CLS token attention to other tokens
-    cls_attention = attention_weights[sample_idx, head_idx, 0, 1:].cpu().numpy()
+    print(f"Attention visualization saved to {output_path}")
     
-    # Plot spatial attention
-    plt.figure(figsize=(10, 10))
-    
-    # Get coordinates from the sample
-    x_coords = sample_x_coords[sample_idx].cpu().numpy()
-    y_coords = sample_y_coords[sample_idx].cpu().numpy()
-    
-    # Normalize attention weights for better visualization
-    norm_attention = (cls_attention - cls_attention.min()) / (cls_attention.max() - cls_attention.min())
-    
-    # Create scatter plot with size and color based on attention
-    plt.scatter(x_coords, y_coords, s=norm_attention*500, c=norm_attention, cmap='viridis', alpha=0.7)
-    plt.colorbar(label='Normalized Attention from CLS Token')
-    plt.title('Spatial Distribution of CLS Token Attention')
-    plt.xlabel('X coordinate')
-    plt.ylabel('Y coordinate')
-    plt.gca().set_aspect('equal')
-    plt.savefig('spatial_attention.png')
+    # Also visualize average attention across heads
+    plt.figure(figsize=(10, 4))
+    avg_attention = cls_attention.mean(axis=0)
+    plt.bar(range(1, window_size + 1), avg_attention)
+    plt.xlabel('Cell Position in Window')
+    plt.ylabel('Average Attention Score')
+    plt.title('Average Attention from CLS Token to Cells (Across All Heads)')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path.replace('.png', '_avg.png'))
     plt.close()
-    print("Saved 'spatial_attention.png'")
+    
+    print(f"Average attention visualization saved to {output_path.replace('.png', '_avg.png')}")
 
 
-def analyze_window_sizes(adata, window_sizes=[5, 10, 15, 20, 30]):
-    """Analyze the impact of different window sizes on cell density"""
+def analyze_window_sizes(adata, window_sizes=[5, 10, 15, 20, 30], 
+                        output_path="window_size_analysis.png"):
+    """
+    Analyze the impact of different window sizes on cell density.
+    
+    Args:
+        adata: AnnData object containing cell data
+        window_sizes: List of window sizes to analyze
+        output_path: Path to save the visualization
+    """
+    print("Analyzing impact of different window sizes")
+    
+    # Get all patients with sufficient number of cells
+    patients = adata.obs['patient_id'].value_counts()
+    viable_patients = patients[patients > max(window_sizes)].index.tolist()
+    
+    if len(viable_patients) == 0:
+        print("No patients with sufficient cells for window size analysis")
+        return
+    
+    # Sample some patients for analysis
+    if len(viable_patients) > 10:
+        selected_patients = np.random.choice(viable_patients, 10, replace=False)
+    else:
+        selected_patients = viable_patients
+    
+    # Analyze window densities for different window sizes
     results = []
     
-    # Get all patient IDs
-    patient_ids = adata.obs['donor'].unique()
-    
-    for patient_id in patient_ids[:5]:  # Analyze first 5 patients for speed
-        patient_mask = adata.obs['donor'] == patient_id
+    for patient_id in selected_patients:
+        patient_data = adata[adata.obs['patient_id'] == patient_id]
         
-        # Get coordinates
-        x_coords = adata.obs['X'][patient_mask].values
-        y_coords = adata.obs['Y'][patient_mask].values
-        coords = np.column_stack([x_coords, y_coords])
+        # Get coordinates for all cells
+        all_coords = np.vstack([
+            patient_data.obs['x_coordinate'].values,
+            patient_data.obs['y_coordinate'].values
+        ]).T
         
         for window_size in window_sizes:
-            # Create nearest neighbors finder
-            nn_finder = NearestNeighbors(n_neighbors=window_size)
-            nn_finder.fit(coords)
+            # Sample some central points
+            if len(patient_data) > 20:
+                center_indices = np.random.choice(len(patient_data), 20, replace=False)
+            else:
+                center_indices = range(len(patient_data))
             
-            # Random sample of 100 cells for speed
-            sample_indices = np.random.choice(len(coords), min(100, len(coords)), replace=False)
+            # Calculate average window density
+            densities = []
             
-            # Compute the average density of cells in the window
-            total_area = 0
-            for idx in sample_indices:
-                center = coords[idx]
-                distances, _ = nn_finder.kneighbors([center])
-                max_distance = distances[0][-1]  # Furthest neighbor
-                area = np.pi * (max_distance ** 2)  # Area of the circle
-                total_area += area
+            for center_idx in center_indices:
+                center_coords = all_coords[center_idx]
+                
+                # Calculate distances from center to all other cells
+                distances = np.sqrt(np.sum((all_coords - center_coords) ** 2, axis=1))
+                
+                # Get the window_size nearest neighbors
+                nearest_distances = np.sort(distances)[:window_size]
+                
+                # Calculate average distance (a proxy for density)
+                avg_distance = np.mean(nearest_distances)
+                densities.append(avg_distance)
             
-            avg_area = total_area / len(sample_indices)
-            avg_density = window_size / avg_area if avg_area > 0 else 0
-            
+            # Store results
             results.append({
                 'patient_id': patient_id,
                 'window_size': window_size,
-                'avg_area': avg_area,
-                'avg_density': avg_density
+                'avg_density': np.mean(densities)
             })
     
-    return pd.DataFrame(results)
-
-
-def analyze_window_size_impact(adata):
-    """Analyze and visualize the impact of different window sizes"""
-    print("\n8. Analyzing Window Size Impact")
+    # Convert to DataFrame
+    results_df = pd.DataFrame(results)
     
-    # Analyze window sizes
-    window_size_analysis = analyze_window_sizes(adata)
-    
-    # Plot window size analysis
+    # Create visualization
     plt.figure(figsize=(10, 6))
-    sns.boxplot(x='window_size', y='avg_density', data=window_size_analysis)
-    plt.title('Cell Density for Different Window Sizes')
-    plt.xlabel('Window Size (number of cells)')
-    plt.ylabel('Cell Density (cells per unit area)')
-    plt.savefig('window_size_analysis.png')
+    sns.boxplot(x='window_size', y='avg_density', data=results_df)
+    plt.xlabel('Window Size (Number of Cells)')
+    plt.ylabel('Average Distance Between Cells')
+    plt.title('Impact of Window Size on Cell Neighborhood Density')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
     plt.close()
-    print("Saved 'window_size_analysis.png'")
+    
+    print(f"Window size analysis saved to {output_path}")
 
 
 def main():
-    """Main function to run all visualization steps"""
-    print("Cell-BERT Model Visualization")
-    print("============================")
-    
-    # 1. Load data
+    """Run all visualization steps."""
+    # Load data
     adata = load_data()
     
-    # 2. Visualize patient distributions
-    visualize_patient_distributions(adata)
+    # Visualize patient distribution
+    visualize_patient_distribution(adata)
     
-    # 3. Visualize spatial distribution
-    patient_data = visualize_spatial_distribution(adata)
+    # Visualize spatial distribution of cells
+    visualize_spatial_distribution(adata)
     
-    # 4. Visualize cell neighborhoods
-    visualize_cell_neighborhoods(patient_data)
+    # Visualize cell neighborhood
+    visualize_cell_neighborhood(adata, window_size=10)
     
-    # 5. Create and load model
-    cell_bert_model, window_aggregator, train_loader, val_loader, device = create_and_load_model(adata)
+    # Create or load model
+    cell_bert_model, window_aggregator, device = create_or_load_model(
+        adata,
+        embedding_dim=64,
+        model_path='cell_bert_model.pt',
+        aggregator_path='cell_bert_aggregator.pt'
+    )
     
-    # 6. Extract and visualize cell embeddings
-    visualize_embeddings(cell_bert_model, val_loader, device)
+    # Visualize embeddings
+    visualize_embeddings(adata, cell_bert_model, device, window_size=10, max_windows=50)
     
-    # 7. Visualize attention patterns
-    visualize_attention_patterns(cell_bert_model, val_loader, device)
+    # Visualize attention pattern
+    visualize_attention(adata, cell_bert_model, device, window_size=10)
     
-    # 8. Analyze window size impact
-    analyze_window_size_impact(adata)
+    # Analyze impact of different window sizes
+    analyze_window_sizes(adata)
     
-    print("\nVisualization complete. All results saved as PNG files.")
+    print("Visualization complete! All plots saved to current directory.")
 
 
 if __name__ == "__main__":
