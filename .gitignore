@@ -5,6 +5,11 @@
 __pycache__/
 *.py[cod]
 
+evaluation/
+evaluation/*
+output/
+output/*
+
 venv/
 .venv/
 env/
