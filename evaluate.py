@@ -47,16 +47,34 @@ def load_model(model_path, device):
     # Get arguments used for training
     train_args = argparse.Namespace(**checkpoint['args'])
     
+    # Get marker_dim from checkpoint or use default value
+    marker_dim = None
+    if 'marker_dim' in checkpoint['args']:
+        marker_dim = checkpoint['args']['marker_dim']
+    else:
+        # Default to 58 markers (as seen in the training output)
+        marker_dim = 58
+        print(f"Warning: marker_dim not found in checkpoint, using default value: {marker_dim}")
+    
+    # Get cell_type parameters
+    num_cell_types = checkpoint['args'].get('num_cell_types', None)
+    if num_cell_types is None:
+        # The model was trained with cell types, assume a default value
+        num_cell_types = 20  # This is a reasonable default
+        print(f"Warning: num_cell_types not found in checkpoint, using default value: {num_cell_types}")
+    
     # Initialize model with the same parameters
     model = SpatialBERTModel(
-        marker_dim=checkpoint['args']['marker_dim'] if 'marker_dim' in checkpoint['args'] else None,
+        marker_dim=marker_dim,
         hidden_dim=train_args.hidden_dim,
         num_heads=train_args.num_heads,
         num_layers=train_args.num_layers,
         dropout=train_args.dropout,
         max_position=train_args.max_position,
         use_global_features=train_args.use_global_features,
-        global_feature_dim=checkpoint['args']['global_feature_dim'] if 'global_feature_dim' in checkpoint['args'] else 0
+        global_feature_dim=checkpoint['args'].get('global_feature_dim', 0),
+        num_cell_types=num_cell_types,
+        cell_type_map=None
     )
     
     # Load model weights
