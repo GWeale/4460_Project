@@ -45,6 +45,7 @@ def load_cell_data(file_path='Melanoma_data.csv'):
     """Load single-cell data and return as DataFrame"""
     cell_df = pd.read_csv(file_path, index_col=0)
     print(f"Loaded cell data with {cell_df.shape[0]} cells and {cell_df.shape[1]} columns")
+    cell_df = cell_df.fillna(0)  # Replace NaN values with zeros
     return cell_df
 
 # 4. Merge Target Variable

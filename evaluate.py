@@ -233,6 +233,8 @@ def evaluate_model(model, dataloader, device, global_features_dict=None):
         }
         
         if len(np.unique(donor_targets)) > 1:
+            donor_outputs = np.nan_to_num(donor_outputs)
+            donor_targets = np.nan_to_num(donor_targets)
             donor_metrics['auc'] = roc_auc_score(donor_targets, donor_outputs)
         else:
             donor_metrics['auc'] = float('nan')
