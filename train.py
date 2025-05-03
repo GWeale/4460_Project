@@ -512,10 +512,15 @@ def plot_roc_curve(targets, outputs, output_path, title="ROC Curve"):
     plt.savefig(output_path)
     plt.close()
 
-def plot_confusion_matrix(targets, preds, output_path, title="Confusion Matrix"):
+def plot_confusion_matrix(targets, preds, output_path, title="Confusion Matrix", class_names=None):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from sklearn.metrics import confusion_matrix
     cm = confusion_matrix(targets, preds)
     plt.figure()
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    if class_names is None:
+        class_names = ['Short Survival', 'Long Survival']
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.title(title)
@@ -576,10 +581,14 @@ def plot_donor_confusion_matrices(train_outputs, train_targets, train_group_ids,
     plt.savefig(output_path)
     plt.close()
 
-def plot_spatial_windows_with_survival(data_dict, train_windows, feature_columns, output_dir, donor_col='donor', cell_type_col=None, n_windows=100, donor_id=None):
+def plot_spatial_windows_with_survival(data_dict, train_windows, feature_columns, output_dir, donor_col='donor', cell_type_col=None, n_windows=100, donor_id=None, window_logits=None, epoch=None):
     """
     Plot all cells in a tissue colored by cell type, overlaying windows from long/short survival donors.
+    Windows are colored by predicted label (logit > 0: long, <= 0: short).
     """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import os
     if cell_type_col is None:
         cell_type_col = feature_columns['cell_types'][0]
     # Get specific donor or random one
@@ -592,25 +601,40 @@ def plot_spatial_windows_with_survival(data_dict, train_windows, feature_columns
     # Plot all cells colored by cell type
     plt.figure(figsize=(10, 10))
     cell_type_map = {v: k for k, v in enumerate(donor_cells[cell_type_col].unique())}
-    colors = matplotlib.colormaps['tab20'].resampled(len(cell_type_map))
-    plt.scatter(donor_cells['x'], donor_cells['y'], c=[cell_type_map[ct] for ct in donor_cells[cell_type_col]], cmap='tab20', alpha=0.3, label='Cells')
-    # Overlay windows
-    for i in range(n_windows):
-        idx = np.random.randint(train_windows['abs_coords'].shape[0])
-        window_coords = train_windows['abs_coords'][idx].cpu().numpy()
-        window_cell_types = train_windows['cell_types'][idx].cpu().numpy()
-        donor_idx = train_windows['group_ids'][idx][0] if isinstance(train_windows['group_ids'][idx], (list, tuple, np.ndarray)) else train_windows['group_ids'][idx]
-        donor_survival = data_dict['train_cells'][data_dict['train_cells'][donor_col] == donor_idx]['High_Survival'].iloc[0]
-        if donor_survival == 1:
-            plt.scatter(window_coords[:, 0], window_coords[:, 1], c='red', alpha=0.15, s=200, marker='s', label='Long Survival' if i == 0 else None)
+    plt.scatter(donor_cells['x'], donor_cells['y'], c=[cell_type_map[ct] for ct in donor_cells[cell_type_col]], cmap='tab20', alpha=0.3, label='Cells', s=0.1)
+    # Filter windows to only include those from the current donor
+    donor_window_indices = []
+    for i, group_id in enumerate(train_windows['group_ids']):
+        window_donor = group_id[0] if isinstance(group_id, (list, tuple, np.ndarray)) else group_id
+        if window_donor == donor:
+            donor_window_indices.append(i)
+    if len(donor_window_indices) == 0:
+        print(f"No windows found for donor {donor}!")
+        return donor
+    print(f"Found {len(donor_window_indices)} windows for donor {donor}")
+    n_windows = min(n_windows, len(donor_window_indices))
+    selected_indices = np.random.choice(donor_window_indices, size=n_windows, replace=False)
+    # Overlay windows colored by predicted label
+    for i, idx in enumerate(selected_indices):
+        # Get center cell coordinate (first cell in window is the center)
+        center_coord = train_windows['abs_coords'][idx][0].cpu().numpy()
+        if window_logits is not None:
+            pred_label = 1 if window_logits[idx] > 0 else 0
         else:
-            plt.scatter(window_coords[:, 0], window_coords[:, 1], c='blue', alpha=0.15, s=200, marker='s', label='Short Survival' if i == 0 else None)
+            pred_label = data_dict['train_cells'][data_dict['train_cells'][donor_col] == donor]['High_Survival'].iloc[0]
+        color = 'red' if pred_label == 1 else 'blue'
+        label = 'Predicted Long Survival' if (i == 0 and pred_label == 1) else ('Predicted Short Survival' if (i == 0 and pred_label == 0) else None)
+        plt.scatter(center_coord[0], center_coord[1], c=color, alpha=0.5, s=200, marker='s', label=label)
     plt.xlabel('X')
     plt.ylabel('Y')
-    plt.title(f'Cells in Donor {donor} with Windows Overlayed by Survival')
+    plt.title(f'Cells in Donor {donor} with Windows Overlayed by Predicted Survival')
     plt.legend(loc='best', bbox_to_anchor=(1.05, 1), ncol=1)
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'spatial_windows_survival.png'))
+    if epoch is not None:
+        save_path = os.path.join(output_dir, f'spatial_windows_survival_epoch_{epoch}.png')
+    else:
+        save_path = os.path.join(output_dir, 'spatial_windows_survival.png')
+    plt.savefig(save_path)
     plt.close()
     return donor
 
@@ -666,7 +690,9 @@ def plot_umap_cell_markers(data_dict, feature_columns, output_dir, n_cells=10000
 def plot_example_windows(train_windows, cell_type_ids, inv_cell_type_map, colors, output_dir):
     import matplotlib.pyplot as plt
     import os
-    n_types = len(inv_cell_type_map)
+    import numpy as np
+    # Get all unique cell types across all windows
+    all_cell_types = np.unique(cell_type_ids.cpu().numpy())
     plt.figure(figsize=(15, 5))
     for i in range(3):  # Plot 3 example windows
         plt.subplot(1, 3, i+1)
@@ -677,22 +703,12 @@ def plot_example_windows(train_windows, cell_type_ids, inv_cell_type_map, colors
         plt.title(f'Window {i+1}')
         plt.xlabel('Absolute X')
         plt.ylabel('Absolute Y')
-        handles = [plt.Line2D([0], [0], marker='o', color='w', label=inv_cell_type_map[ct],
-                              markerfacecolor=colors(ct), markersize=8) for ct in np.unique(window_cell_types)]
-        plt.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left', title='Cell Type')
-    plt.tight_layout()
+    # Global legend for all cell types
+    handles = [plt.Line2D([0], [0], marker='o', color='w', label=inv_cell_type_map[ct],
+                          markerfacecolor=colors(ct), markersize=8) for ct in all_cell_types]
+    plt.figlegend(handles=handles, loc='center right', title='Cell Type', bbox_to_anchor=(0.98, 0.5))
+    plt.tight_layout(rect=[0, 0, 0.95, 1])
     plt.savefig(os.path.join(output_dir, 'example_windows.png'))
-    plt.close()
-
-def plot_window_size_histogram(window_sizes, output_dir):
-    import matplotlib.pyplot as plt
-    import os
-    plt.figure()
-    plt.hist(window_sizes, bins=30, color='gray', edgecolor='black')
-    plt.xlabel('Number of Cells in Window')
-    plt.ylabel('Count')
-    plt.title('Distribution of Window Sizes (Cells per Window)')
-    plt.savefig(os.path.join(output_dir, 'window_size_hist.png'))
     plt.close()
 
 def plot_grid_cell_density_histogram(cell_df, output_dir, donor_col='donor', grid_size=50, donor_id=None):
@@ -728,7 +744,7 @@ def plot_cell_type_prevalence_by_window_survival(train_windows, cell_type_map, o
     labels = train_windows['labels'].cpu().numpy()  # shape: (n_windows,)
     # Invert cell_type_map for names
     inv_cell_type_map = {v: k for k, v in cell_type_map.items()}
-    n_types = len(inv_cell_type_map)
+    n_types = max(max(inv_cell_type_map.keys())+1, np.max(cell_types)+1)
     # Flatten all cell types for each window, grouped by label
     long_mask = labels == 1
     short_mask = labels == 0
@@ -738,17 +754,19 @@ def plot_cell_type_prevalence_by_window_survival(train_windows, cell_type_map, o
     long_counts = np.bincount(long_types, minlength=n_types)
     short_counts = np.bincount(short_types, minlength=n_types)
     # Normalize to fractions
-    long_frac = long_counts / long_counts.sum()
-    short_frac = short_counts / short_counts.sum()
+    long_frac = long_counts / long_counts.sum() if long_counts.sum() > 0 else np.zeros(n_types)
+    short_frac = short_counts / short_counts.sum() if short_counts.sum() > 0 else np.zeros(n_types)
     # Barplot
     x = np.arange(n_types)
     width = 0.35
     plt.figure(figsize=(12, 6))
     plt.bar(x - width/2, long_frac, width, label='Long Survival Windows')
     plt.bar(x + width/2, short_frac, width, label='Short Survival Windows')
-    plt.xticks(x, [inv_cell_type_map[i] for i in range(n_types)], rotation=45, ha='right')
+    xticklabels = [inv_cell_type_map.get(i, f'Unknown_{i}') for i in range(n_types)]
+    plt.xticks(x, xticklabels, rotation=45, ha='right')
     plt.ylabel('Fraction of Cells')
     plt.title('Cell Type Prevalence in Long vs Short Survival Windows')
+    plt.yscale('log')
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'cell_type_prevalence_long_vs_short.png'))
@@ -822,46 +840,8 @@ def main():
     
     plot_example_windows(train_windows, cell_type_ids, inv_cell_type_map, colors, os.path.join(args.output_dir, 'figures'))
     
-    # After generating train_windows
-    donor_id = plot_spatial_windows_with_survival(data_dict, train_windows, feature_columns, os.path.join(args.output_dir, 'figures'))
-    plot_window_size_histogram(train_windows['window_sizes'], os.path.join(args.output_dir, 'figures'))
-    plot_cell_density_heatmap(data_dict['train_cells'], os.path.join(args.output_dir, 'figures'), donor_id=donor_id)
-    plot_grid_cell_density_histogram(data_dict['train_cells'], os.path.join(args.output_dir, 'figures'), donor_id=donor_id)
-    plot_cell_type_prevalence_by_window_survival(train_windows, cell_type_map, os.path.join(args.output_dir, 'figures'))
-    
-    # Generate windows for validation data
-    print("Generating windows for validation data...")
-    val_windows = window_generator.generate_windows(
-        data_dict['val_cells_normalized'],
-        num_windows_per_sample=args.windows_per_sample
-    )
-    print(f"Number of validation windows after filtering: {val_windows['marker_values'].shape[0]}")
-    assert val_windows['marker_values'].shape[0] == val_windows['labels'].shape[0], "Mismatch between marker_values and labels in val_windows!"
-    
-    # Add [CLS] tokens
-    train_windows = window_generator.add_cls_tokens(train_windows)
-    val_windows = window_generator.add_cls_tokens(val_windows)
-    
-    # Create datasets and data loaders
-    train_dataset = WindowDataset(train_windows)
-    val_dataset = WindowDataset(val_windows)
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_windows
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_windows
-    )
-    
+    # Add before the training loop:
     # Initialize model
-    print("Initializing model...")
     model = SpatialBERTModel(
         marker_dim=len(window_generator.marker_cols),
         hidden_dim=args.hidden_dim,
@@ -874,13 +854,35 @@ def main():
         use_global_features=args.use_global_features,
         global_feature_dim=global_feature_dim
     )
-    
-    # Move model to device
     model = model.to(args.device)
-    
     # Initialize optimizer and loss function
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     criterion = nn.BCEWithLogitsLoss()
+    # Create datasets and data loaders
+    train_dataset = WindowDataset(window_generator.add_cls_tokens(train_windows))
+    val_windows = window_generator.generate_windows(
+        data_dict['val_cells_normalized'],
+        num_windows_per_sample=args.windows_per_sample
+    )
+    val_windows = window_generator.add_cls_tokens(val_windows)
+    val_dataset = WindowDataset(val_windows)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_windows
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=collate_windows
+    )
+    
+    # After model = model.to(args.device)
+    num_params = sum(p.numel() for p in model.parameters())
+    param_size_mb = sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**2
+    print(f"Model parameters: {num_params:,} ({param_size_mb:.2f} MB)")
     
     # Training loop
     print("Starting training...")
@@ -963,10 +965,14 @@ def main():
             model_path=latest_model_path
         )
 
+        # After each epoch, plot ROC for training and validation
+        plot_roc_curve(train_targets, train_outputs, os.path.join(args.output_dir, 'figures', f'roc_curve_window_train_epoch_{epoch}.png'), title='ROC Curve (Window-level, Train)')
+        plot_roc_curve(val_targets, val_outputs, os.path.join(args.output_dir, 'figures', f'roc_curve_window_val_epoch_{epoch}.png'), title='ROC Curve (Window-level, Val)')
+
         # Window-level
         window_preds = (val_outputs > 0).astype(int)
         plot_roc_curve(val_targets, val_outputs, os.path.join(args.output_dir, 'figures', 'roc_curve_window.png'), title='ROC Curve (Window-level)')
-        plot_confusion_matrix(val_targets, window_preds, os.path.join(args.output_dir, 'figures', 'confusion_matrix_window.png'), title='Confusion Matrix (Window-level)')
+        plot_confusion_matrix(val_targets, window_preds, os.path.join(args.output_dir, 'figures', 'confusion_matrix_window.png'), title='Confusion Matrix (Window-level)', class_names=['Short Survival', 'Long Survival'])
         plot_pr_curve(val_targets, val_outputs, os.path.join(args.output_dir, 'figures', 'pr_curve_window.png'), title='PR Curve (Window-level)')
         plot_output_distribution(val_outputs, val_targets, os.path.join(args.output_dir, 'figures', 'output_dist_window.png'), class_names=['Short Survival', 'Long Survival'])
 
@@ -978,9 +984,15 @@ def main():
             if donor_outputs.size > 0 and donor_targets.size > 0:
                 donor_preds = (donor_outputs > 0).astype(int)
                 plot_roc_curve(donor_targets, donor_outputs, os.path.join(args.output_dir, 'figures', 'roc_curve_donor.png'), title='ROC Curve (Donor-level)')
-                plot_confusion_matrix(donor_targets, donor_preds, os.path.join(args.output_dir, 'figures', 'confusion_matrix_donor.png'), title='Confusion Matrix (Donor-level)')
+                plot_confusion_matrix(donor_targets, donor_preds, os.path.join(args.output_dir, 'figures', 'confusion_matrix_donor.png'), title='Confusion Matrix (Donor-level)', class_names=['Short Survival', 'Long Survival'])
                 plot_pr_curve(donor_targets, donor_outputs, os.path.join(args.output_dir, 'figures', 'pr_curve_donor.png'), title='PR Curve (Donor-level)')
                 plot_output_distribution(donor_outputs, donor_targets, os.path.join(args.output_dir, 'figures', 'output_dist_donor.png'), class_names=['Short Survival', 'Long Survival'])
+
+        # After validation and after train_outputs are available, call:
+        donor_id = plot_spatial_windows_with_survival(data_dict, train_windows, feature_columns, os.path.join(args.output_dir, 'figures'), window_logits=train_outputs, epoch=epoch)
+        plot_cell_density_heatmap(data_dict['train_cells'], os.path.join(args.output_dir, 'figures'), donor_id=donor_id)
+        plot_grid_cell_density_histogram(data_dict['train_cells'], os.path.join(args.output_dir, 'figures'), donor_id=donor_id)
+        plot_cell_type_prevalence_by_window_survival(train_windows, cell_type_map, os.path.join(args.output_dir, 'figures'))
 
     # Plot training curves
     plt.figure(figsize=(10, 6))
