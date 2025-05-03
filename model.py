@@ -303,50 +303,40 @@ class WindowGenerator:
         
         # Get neighbors for center cells
         windows = neighbor_indices[center_indices]
-        
+        # Get number of cells in each window
+        window_sizes = np.array([len(window) for window in windows])
+        # Filter windows with >= 10 cells
+        valid_mask = window_sizes >= 10
+        windows = windows[valid_mask]
+        window_sizes = window_sizes[valid_mask]
         # Get coordinates for windows
         window_coordinates = np.array([coordinates[window] for window in windows])
-        
-        # Get center coordinates for each window
-        center_coordinates = coordinates[center_indices].reshape(-1, 1, 2)
-        
-        # Calculate relative positions
+        center_coordinates = coordinates[center_indices][valid_mask].reshape(-1, 1, 2)
         rel_positions = window_coordinates - center_coordinates
-        
-        # Scale and discretize positions
-        # Map to range [0, max_position)
         max_dist = np.max(np.abs(rel_positions))
         scale_factor = (self.max_position // 2) / max_dist if max_dist > 0 else 1
         rel_positions = rel_positions * scale_factor
         rel_positions = rel_positions.astype(int) + (self.max_position // 2)
-        
-        # Clip to valid range
         rel_positions = np.clip(rel_positions, 0, self.max_position - 1)
-        
-        # Get marker values for windows
         marker_values = np.array([sample_df.iloc[window][self.marker_cols].values for window in windows])
-        
-        # Get cell types for windows if available
         if self.cell_type_col in sample_df.columns and self.cell_type_map is not None:
             cell_types = sample_df[self.cell_type_col].map(self.cell_type_map).fillna(0).astype(int)
             window_cell_types = np.array([cell_types.iloc[window].values for window in windows])
         else:
             window_cell_types = None
-        
-        # Get survival label for the sample
         if 'High_Survival' in sample_df.columns:
-            # All cells in the sample should have the same label
             label = sample_df['High_Survival'].iloc[0]
         else:
             label = None
-            
         return {
             'windows': windows,
             'marker_values': marker_values,
             'rel_positions': rel_positions,
             'cell_types': window_cell_types,
             'label': label,
-            'center_indices': center_indices
+            'center_indices': center_indices[valid_mask],
+            'abs_coords': window_coordinates,
+            'window_sizes': window_sizes
         }
     
     def generate_windows(self, cell_df, group_cols=['donor', 'filename'], num_windows_per_sample=None):
@@ -370,6 +360,8 @@ class WindowGenerator:
         all_cell_types = []
         all_labels = []
         all_group_ids = []
+        all_abs_coords = []
+        all_window_sizes = []
         
         # Generate windows for each sample
         for group_id, sample_df in tqdm(grouped, desc="Generating windows"):
@@ -389,6 +381,8 @@ class WindowGenerator:
                 all_labels.append(np.full(len(window_data['windows']), window_data['label']))
                 
             all_group_ids.append([group_id] * len(window_data['windows']))
+            all_abs_coords.append(window_data['abs_coords'])
+            all_window_sizes.append(window_data['window_sizes'])
         
         # Concatenate results
         marker_values = np.concatenate(all_marker_values, axis=0)
@@ -418,6 +412,13 @@ class WindowGenerator:
                 device=self.device
             )
             
+        abs_coords = np.concatenate(all_abs_coords, axis=0)
+        abs_coords_tensor = torch.tensor(abs_coords, dtype=torch.float32, device=self.device)
+        result['abs_coords'] = abs_coords_tensor
+        
+        window_sizes = np.concatenate(all_window_sizes, axis=0)
+        result['window_sizes'] = window_sizes
+        
         return result
     
     def add_cls_tokens(self, window_data):

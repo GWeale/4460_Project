@@ -6,11 +6,15 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, precision_score, recall_score, confusion_matrix, roc_curve, auc, precision_recall_curve, average_precision_score
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from sklearn.decomposition import PCA
+import seaborn as sns
+import scanpy as sc
+import matplotlib
 
-from data_prep import prepare_data
+from data_prep import prepare_data, identify_feature_columns
 from model import SpatialBERTModel, WindowGenerator, WindowDataset, collate_windows
 
 def parse_args():
@@ -338,6 +342,418 @@ def save_model(model, optimizer, epoch, args, metrics, model_path):
     torch.save(checkpoint, model_path)
     print(f"Model saved to {model_path}")
 
+def plot_pca_visualization(data_dict, feature_columns, output_dir, n_samples=10000):
+    """
+    Perform PCA on marker data and create visualizations
+    
+    Parameters:
+    - data_dict: Dict with train/val/test DataFrames
+    - feature_columns: Dict with categorized column names
+    - output_dir: Directory to save plots
+    - n_samples: Number of samples to use for visualization (default: 10000)
+    """
+    # Subsample data from each split proportionally
+    total_cells = len(data_dict['train_cells']) + len(data_dict['val_cells']) + len(data_dict['test_cells'])
+    train_samples = int(n_samples * len(data_dict['train_cells']) / total_cells)
+    val_samples = int(n_samples * len(data_dict['val_cells']) / total_cells)
+    test_samples = n_samples - train_samples - val_samples
+    
+    # Sample from each split
+    train_subset = data_dict['train_cells'].sample(n=train_samples, random_state=42)
+    val_subset = data_dict['val_cells'].sample(n=val_samples, random_state=42)
+    test_subset = data_dict['test_cells'].sample(n=test_samples, random_state=42)
+    
+    # Combine subsampled data for PCA
+    all_markers = pd.concat([
+        train_subset[feature_columns['markers']],
+        val_subset[feature_columns['markers']],
+        test_subset[feature_columns['markers']]
+    ])
+    
+    # Perform PCA
+    pca = PCA(n_components=2)
+    pca_result = pca.fit_transform(all_markers)
+    
+    # Create DataFrame with PCA results and metadata
+    pca_df = pd.DataFrame(pca_result, columns=['PC1', 'PC2'])
+    
+    # Add split information
+    pca_df['split'] = ['train'] * len(train_subset) + \
+                      ['val'] * len(val_subset) + \
+                      ['test'] * len(test_subset)
+    
+    # Add survival information
+    pca_df['High_Survival'] = pd.concat([
+        train_subset['High_Survival'],
+        val_subset['High_Survival'],
+        test_subset['High_Survival']
+    ]).values
+    
+    # Plot 1: PCA by split
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(data=pca_df, x='PC1', y='PC2', hue='split', alpha=0.6)
+    plt.title(f'PCA of Marker Expression by Data Split (n={n_samples:,} samples)')
+    plt.savefig(os.path.join(output_dir, 'pca_by_split.png'))
+    plt.close()
+    
+    # Plot 2: PCA by survival
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(data=pca_df, x='PC1', y='PC2', hue='High_Survival', alpha=0.6)
+    plt.title(f'PCA of Marker Expression by Survival Status (n={n_samples:,} samples)')
+    plt.savefig(os.path.join(output_dir, 'pca_by_survival.png'))
+    plt.close()
+    
+    # Plot 3: Explained variance
+    pca_10 = PCA(n_components=10)
+    pca_10.fit(all_markers)
+    plt.figure(figsize=(10, 6))
+    plt.plot(np.cumsum(pca_10.explained_variance_ratio_))
+    plt.xlabel('Number of Components')
+    plt.ylabel('Cumulative Explained Variance')
+    plt.title('PCA Explained Variance')
+    plt.savefig(os.path.join(output_dir, 'pca_explained_variance.png'))
+    plt.close()
+    
+    # Print explained variance
+    print(f"First 2 PCs explain {pca.explained_variance_ratio_[:2].sum():.2%} of variance")
+    print(f"Used {n_samples:,} samples for visualization ({train_samples:,} train, {val_samples:,} val, {test_samples:,} test)")
+    
+    return pca
+
+def plot_donor_mean_pca(data_dict, feature_columns, output_dir, n_samples_per_donor=50, cells_per_sample=1000):
+    """
+    Plot PCA of mean expression per donor with subsampling
+    
+    Parameters:
+    - data_dict: Dict with train/val/test DataFrames
+    - feature_columns: Dict with categorized column names
+    - output_dir: Directory to save plots
+    - n_samples_per_donor: Number of subsamples per donor
+    - cells_per_sample: Number of cells per subsample
+    """
+    # Get all donors
+    all_donors = pd.concat([
+        data_dict['train_cells']['donor'],
+        data_dict['val_cells']['donor'],
+        data_dict['test_cells']['donor']
+    ]).unique()
+    
+    # Initialize lists for means and survival
+    means = []
+    survival = []
+    donors = []
+    
+    # For each donor, create multiple subsamples
+    for donor in tqdm(all_donors, desc="Processing donors"):
+        # Get donor data
+        donor_data = pd.concat([
+            data_dict['train_cells'][data_dict['train_cells']['donor'] == donor],
+            data_dict['val_cells'][data_dict['val_cells']['donor'] == donor],
+            data_dict['test_cells'][data_dict['test_cells']['donor'] == donor]
+        ])
+        
+        # Create multiple subsamples
+        for _ in range(n_samples_per_donor):
+            # Randomly sample cells
+            if len(donor_data) > cells_per_sample:
+                subsample = donor_data.sample(n=cells_per_sample, random_state=42)
+            else:
+                subsample = donor_data
+                
+            # Calculate mean expression
+            mean_expr = subsample[feature_columns['markers']].mean()
+            means.append(mean_expr)
+            survival.append(subsample['High_Survival'].iloc[0])
+            donors.append(donor)
+    
+    # Convert to numpy arrays
+    means = np.array(means)
+    survival = np.array(survival)
+    
+    # Perform PCA
+    pca = PCA(n_components=2)
+    pca_result = pca.fit_transform(means)
+    
+    # Create DataFrame for plotting
+    pca_df = pd.DataFrame(pca_result, columns=['PC1', 'PC2'])
+    pca_df['High_Survival'] = survival
+    pca_df['Donor'] = donors
+    
+    # Plot 1: PCA by survival
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(data=pca_df, x='PC1', y='PC2', hue='High_Survival', alpha=0.6)
+    plt.title(f'PCA of Mean Expression per Donor\n({n_samples_per_donor} subsamples of {cells_per_sample} cells each)')
+    plt.savefig(os.path.join(output_dir, 'pca_donor_mean_survival.png'))
+    plt.close()
+    
+    # Plot 2: PCA by donor
+    plt.figure(figsize=(12, 8))
+    sns.scatterplot(data=pca_df, x='PC1', y='PC2', hue='Donor', alpha=0.6)
+    plt.title(f'PCA of Mean Expression per Donor\n({n_samples_per_donor} subsamples of {cells_per_sample} cells each)')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'pca_donor_mean_donor.png'))
+    plt.close()
+    
+    # Print explained variance
+    print(f"First 2 PCs explain {pca.explained_variance_ratio_[:2].sum():.2%} of variance")
+    print(f"Created {len(means)} subsamples ({n_samples_per_donor} per donor)")
+
+def plot_roc_curve(targets, outputs, output_path, title="ROC Curve"):
+    fpr, tpr, _ = roc_curve(targets, outputs)
+    roc_auc = auc(fpr, tpr)
+    plt.figure()
+    plt.plot(fpr, tpr, label=f'AUC = {roc_auc:.2f}')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('FPR')
+    plt.ylabel('TPR')
+    plt.title(title)
+    plt.legend()
+    plt.savefig(output_path)
+    plt.close()
+
+def plot_confusion_matrix(targets, preds, output_path, title="Confusion Matrix"):
+    cm = confusion_matrix(targets, preds)
+    plt.figure()
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title(title)
+    plt.savefig(output_path)
+    plt.close()
+
+def plot_pr_curve(targets, outputs, output_path, title="Precision-Recall Curve"):
+    precision, recall, _ = precision_recall_curve(targets, outputs)
+    ap = average_precision_score(targets, outputs)
+    plt.figure()
+    plt.plot(recall, precision, label=f'AP = {ap:.2f}')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title(title)
+    plt.legend()
+    plt.savefig(output_path)
+    plt.close()
+
+def plot_output_distribution(outputs, targets, output_path, class_names=None):
+    plt.figure()
+    if class_names is None:
+        class_names = ['Class 0', 'Class 1']
+    plt.hist(np.array(outputs)[np.array(targets)==0], bins=50, alpha=0.5, label=class_names[0])
+    plt.hist(np.array(outputs)[np.array(targets)==1], bins=50, alpha=0.5, label=class_names[1])
+    plt.xlabel('Model Output (logit; >0 = Long Survival, <0 = Short Survival)')
+    plt.ylabel('Count')
+    plt.legend()
+    plt.title('Distribution of Model Outputs')
+    plt.savefig(output_path)
+    plt.close()
+
+def plot_donor_confusion_matrices(train_outputs, train_targets, train_group_ids, test_outputs, test_targets, test_group_ids, output_path):
+    """
+    Plot donor-level confusion matrices for train and test as subplots.
+    """
+    def aggregate_by_donor(outputs, targets, group_ids):
+        df = pd.DataFrame({
+            'output': outputs,
+            'target': targets,
+            'donor': [gid[0] if isinstance(gid, (list, tuple, np.ndarray)) else gid for gid in group_ids]
+        })
+        donor_df = df.groupby('donor').agg({'output': 'mean', 'target': 'first'})
+        donor_preds = (donor_df['output'].values > 0).astype(int)
+        donor_targets = donor_df['target'].values.astype(int)
+        return donor_preds, donor_targets
+
+    train_preds, train_true = aggregate_by_donor(train_outputs, train_targets, train_group_ids)
+    test_preds, test_true = aggregate_by_donor(test_outputs, test_targets, test_group_ids)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for ax, preds, true, title in zip(axes, [train_preds, test_preds], [train_true, test_true], ["Train", "Test"]):
+        cm = confusion_matrix(true, preds)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax)
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('True')
+        ax.set_title(f'Donor-level Confusion Matrix ({title})')
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+def plot_spatial_windows_with_survival(data_dict, train_windows, feature_columns, output_dir, donor_col='donor', cell_type_col=None, n_windows=100, donor_id=None):
+    """
+    Plot all cells in a tissue colored by cell type, overlaying windows from long/short survival donors.
+    """
+    if cell_type_col is None:
+        cell_type_col = feature_columns['cell_types'][0]
+    # Get specific donor or random one
+    if donor_id is None:
+        donor = data_dict['train_cells'][donor_col].sample(1).values[0]
+    else:
+        donor = donor_id
+    print(f"Plotting spatial windows for donor: {donor}")
+    donor_cells = data_dict['train_cells'][data_dict['train_cells'][donor_col] == donor]
+    # Plot all cells colored by cell type
+    plt.figure(figsize=(10, 10))
+    cell_type_map = {v: k for k, v in enumerate(donor_cells[cell_type_col].unique())}
+    colors = matplotlib.colormaps['tab20'].resampled(len(cell_type_map))
+    plt.scatter(donor_cells['x'], donor_cells['y'], c=[cell_type_map[ct] for ct in donor_cells[cell_type_col]], cmap='tab20', alpha=0.3, label='Cells')
+    # Overlay windows
+    for i in range(n_windows):
+        idx = np.random.randint(train_windows['abs_coords'].shape[0])
+        window_coords = train_windows['abs_coords'][idx].cpu().numpy()
+        window_cell_types = train_windows['cell_types'][idx].cpu().numpy()
+        donor_idx = train_windows['group_ids'][idx][0] if isinstance(train_windows['group_ids'][idx], (list, tuple, np.ndarray)) else train_windows['group_ids'][idx]
+        donor_survival = data_dict['train_cells'][data_dict['train_cells'][donor_col] == donor_idx]['High_Survival'].iloc[0]
+        if donor_survival == 1:
+            plt.scatter(window_coords[:, 0], window_coords[:, 1], c='red', alpha=0.15, s=200, marker='s', label='Long Survival' if i == 0 else None)
+        else:
+            plt.scatter(window_coords[:, 0], window_coords[:, 1], c='blue', alpha=0.15, s=200, marker='s', label='Short Survival' if i == 0 else None)
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.title(f'Cells in Donor {donor} with Windows Overlayed by Survival')
+    plt.legend(loc='best', bbox_to_anchor=(1.05, 1), ncol=1)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'spatial_windows_survival.png'))
+    plt.close()
+    return donor
+
+def plot_cell_density_heatmap(cell_df, output_dir, donor_col='donor', grid_size=50, donor_id=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    # Use specific donor or random one
+    if donor_id is None:
+        donor = cell_df[donor_col].sample(1).values[0]
+    else:
+        donor = donor_id
+    print(f"Plotting cell density heatmap for donor: {donor}")
+    donor_cells = cell_df[cell_df[donor_col] == donor]
+    x = donor_cells['x'].values
+    y = donor_cells['y'].values
+    # Create 2D histogram with smaller grid size for better resolution
+    heatmap, xedges, yedges = np.histogram2d(x, y, bins=grid_size)
+    extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
+    plt.figure(figsize=(10, 10))
+    plt.imshow(heatmap.T, extent=extent, origin='lower', aspect='auto', cmap='viridis')
+    plt.colorbar(label='Cell Count')
+    plt.xlabel('X')
+    plt.ylabel('Y')
+    plt.title(f'Cell Density Heatmap for Donor {donor}')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'cell_density_heatmap.png'))
+    plt.close()
+
+def plot_umap_cell_markers(data_dict, feature_columns, output_dir, n_cells=10000):
+    """
+    Plot UMAP of cell protein markers colored by cell type using scanpy.
+    """
+    # Subsample cells
+    all_cells = pd.concat([
+        data_dict['train_cells'],
+        data_dict['val_cells'],
+        data_dict['test_cells']
+    ])
+    subsample = all_cells.sample(n=min(n_cells, len(all_cells)), random_state=42)
+    markers = subsample[feature_columns['markers']].values
+    cell_types = subsample[feature_columns['cell_types'][0]].astype(str).values
+    adata = sc.AnnData(markers)
+    adata.obs['cell_type'] = cell_types
+    sc.pp.neighbors(adata, use_rep='X')
+    sc.tl.umap(adata)
+    sc.pl.umap(adata, color='cell_type', show=False, save='_celltype.png', wspace=0.4)
+    # Move the plot to the output_dir
+    import shutil
+    if os.path.exists('figures/umap_celltype.png'):
+        shutil.move('figures/umap_celltype.png', os.path.join(output_dir, 'umap_celltype.png'))
+
+def plot_example_windows(train_windows, cell_type_ids, inv_cell_type_map, colors, output_dir):
+    import matplotlib.pyplot as plt
+    import os
+    n_types = len(inv_cell_type_map)
+    plt.figure(figsize=(15, 5))
+    for i in range(3):  # Plot 3 example windows
+        plt.subplot(1, 3, i+1)
+        window_idx = np.random.randint(train_windows['abs_coords'].shape[0])
+        window_coords = train_windows['abs_coords'][window_idx].cpu().numpy()
+        window_cell_types = cell_type_ids[window_idx].cpu().numpy()
+        scatter = plt.scatter(window_coords[:, 0], window_coords[:, 1], c=window_cell_types, cmap='tab20', alpha=0.7)
+        plt.title(f'Window {i+1}')
+        plt.xlabel('Absolute X')
+        plt.ylabel('Absolute Y')
+        handles = [plt.Line2D([0], [0], marker='o', color='w', label=inv_cell_type_map[ct],
+                              markerfacecolor=colors(ct), markersize=8) for ct in np.unique(window_cell_types)]
+        plt.legend(handles=handles, bbox_to_anchor=(1.05, 1), loc='upper left', title='Cell Type')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'example_windows.png'))
+    plt.close()
+
+def plot_window_size_histogram(window_sizes, output_dir):
+    import matplotlib.pyplot as plt
+    import os
+    plt.figure()
+    plt.hist(window_sizes, bins=30, color='gray', edgecolor='black')
+    plt.xlabel('Number of Cells in Window')
+    plt.ylabel('Count')
+    plt.title('Distribution of Window Sizes (Cells per Window)')
+    plt.savefig(os.path.join(output_dir, 'window_size_hist.png'))
+    plt.close()
+
+def plot_grid_cell_density_histogram(cell_df, output_dir, donor_col='donor', grid_size=50, donor_id=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    # Use specific donor or random one
+    if donor_id is None:
+        donor = cell_df[donor_col].sample(1).values[0]
+    else:
+        donor = donor_id
+    donor_cells = cell_df[cell_df[donor_col] == donor]
+    x = donor_cells['x'].values
+    y = donor_cells['y'].values
+    heatmap, xedges, yedges = np.histogram2d(x, y, bins=grid_size)
+    # Flatten and plot histogram
+    plt.figure()
+    plt.hist(heatmap.flatten(), bins=30, color='gray', edgecolor='black')
+    plt.xlabel('Number of Cells per Grid Cell')
+    plt.ylabel('Count')
+    plt.title(f'Distribution of Cell Density per Grid Cell (Donor {donor})')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'grid_cell_density_hist.png'))
+    plt.close()
+
+def plot_cell_type_prevalence_by_window_survival(train_windows, cell_type_map, output_dir):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import os
+    import pandas as pd
+    # Get cell types and window labels
+    cell_types = train_windows['cell_types'].cpu().numpy()  # shape: (n_windows, window_size)
+    labels = train_windows['labels'].cpu().numpy()  # shape: (n_windows,)
+    # Invert cell_type_map for names
+    inv_cell_type_map = {v: k for k, v in cell_type_map.items()}
+    n_types = len(inv_cell_type_map)
+    # Flatten all cell types for each window, grouped by label
+    long_mask = labels == 1
+    short_mask = labels == 0
+    long_types = cell_types[long_mask].flatten()
+    short_types = cell_types[short_mask].flatten()
+    # Count prevalence
+    long_counts = np.bincount(long_types, minlength=n_types)
+    short_counts = np.bincount(short_types, minlength=n_types)
+    # Normalize to fractions
+    long_frac = long_counts / long_counts.sum()
+    short_frac = short_counts / short_counts.sum()
+    # Barplot
+    x = np.arange(n_types)
+    width = 0.35
+    plt.figure(figsize=(12, 6))
+    plt.bar(x - width/2, long_frac, width, label='Long Survival Windows')
+    plt.bar(x + width/2, short_frac, width, label='Short Survival Windows')
+    plt.xticks(x, [inv_cell_type_map[i] for i in range(n_types)], rotation=45, ha='right')
+    plt.ylabel('Fraction of Cells')
+    plt.title('Cell Type Prevalence in Long vs Short Survival Windows')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'cell_type_prevalence_long_vs_short.png'))
+    plt.close()
+
 def main():
     # Parse command-line arguments
     args = parse_args()
@@ -347,6 +763,7 @@ def main():
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, 'figures'), exist_ok=True)
     
     # Prepare data
     print("Preparing data...")
@@ -356,6 +773,17 @@ def main():
         os_threshold=args.os_threshold,
         apply_batch_corr=args.apply_batch_corr
     )
+    
+    # Get feature columns
+    feature_columns = identify_feature_columns(data_dict['train_cells'])
+    
+    # Perform PCA visualization before training
+    print("Performing PCA visualization...")
+    pca = plot_pca_visualization(data_dict, feature_columns, os.path.join(args.output_dir, 'figures'))
+    
+    # Perform donor mean PCA visualization
+    print("Performing donor mean PCA visualization...")
+    plot_donor_mean_pca(data_dict, feature_columns, os.path.join(args.output_dir, 'figures'))
     
     # Prepare global features if needed
     global_features_dict, global_feature_dim = prepare_global_features(data_dict['metadata_full'], args)
@@ -378,6 +806,28 @@ def main():
         data_dict['train_cells_normalized'],
         num_windows_per_sample=args.windows_per_sample
     )
+    print(f"Number of training windows after filtering: {train_windows['marker_values'].shape[0]}")
+    assert train_windows['marker_values'].shape[0] == train_windows['labels'].shape[0], "Mismatch between marker_values and labels in train_windows!"
+    
+    # Visualize some example windows
+    print("Visualizing example windows...")
+    print("Window structure:", {k: type(v) for k, v in train_windows.items()})
+    print("Window shapes:", {k: v.shape if hasattr(v, 'shape') else len(v) for k, v in train_windows.items()})
+    
+    cell_type_ids = train_windows['cell_types']  # shape: (n_windows, window_size)
+    cell_type_map = window_generator.cell_type_map
+    inv_cell_type_map = {v: k for k, v in cell_type_map.items()}
+    n_types = len(cell_type_map)
+    colors = matplotlib.colormaps['tab20'].resampled(n_types)
+    
+    plot_example_windows(train_windows, cell_type_ids, inv_cell_type_map, colors, os.path.join(args.output_dir, 'figures'))
+    
+    # After generating train_windows
+    donor_id = plot_spatial_windows_with_survival(data_dict, train_windows, feature_columns, os.path.join(args.output_dir, 'figures'))
+    plot_window_size_histogram(train_windows['window_sizes'], os.path.join(args.output_dir, 'figures'))
+    plot_cell_density_heatmap(data_dict['train_cells'], os.path.join(args.output_dir, 'figures'), donor_id=donor_id)
+    plot_grid_cell_density_histogram(data_dict['train_cells'], os.path.join(args.output_dir, 'figures'), donor_id=donor_id)
+    plot_cell_type_prevalence_by_window_survival(train_windows, cell_type_map, os.path.join(args.output_dir, 'figures'))
     
     # Generate windows for validation data
     print("Generating windows for validation data...")
@@ -385,6 +835,8 @@ def main():
         data_dict['val_cells_normalized'],
         num_windows_per_sample=args.windows_per_sample
     )
+    print(f"Number of validation windows after filtering: {val_windows['marker_values'].shape[0]}")
+    assert val_windows['marker_values'].shape[0] == val_windows['labels'].shape[0], "Mismatch between marker_values and labels in val_windows!"
     
     # Add [CLS] tokens
     train_windows = window_generator.add_cls_tokens(train_windows)
@@ -510,7 +962,26 @@ def main():
             metrics={**val_metrics, **(donor_metrics or {})},
             model_path=latest_model_path
         )
-    
+
+        # Window-level
+        window_preds = (val_outputs > 0).astype(int)
+        plot_roc_curve(val_targets, val_outputs, os.path.join(args.output_dir, 'figures', 'roc_curve_window.png'), title='ROC Curve (Window-level)')
+        plot_confusion_matrix(val_targets, window_preds, os.path.join(args.output_dir, 'figures', 'confusion_matrix_window.png'), title='Confusion Matrix (Window-level)')
+        plot_pr_curve(val_targets, val_outputs, os.path.join(args.output_dir, 'figures', 'pr_curve_window.png'), title='PR Curve (Window-level)')
+        plot_output_distribution(val_outputs, val_targets, os.path.join(args.output_dir, 'figures', 'output_dist_window.png'), class_names=['Short Survival', 'Long Survival'])
+
+        # Donor-level (if donor_metrics is not None)
+        if donor_metrics is not None and 'donor_auc' in donor_metrics:
+            # You need donor-level outputs/targets
+            donor_outputs = np.array([v for v in donor_metrics.get('donor_outputs', [])])
+            donor_targets = np.array([v for v in donor_metrics.get('donor_targets', [])])
+            if donor_outputs.size > 0 and donor_targets.size > 0:
+                donor_preds = (donor_outputs > 0).astype(int)
+                plot_roc_curve(donor_targets, donor_outputs, os.path.join(args.output_dir, 'figures', 'roc_curve_donor.png'), title='ROC Curve (Donor-level)')
+                plot_confusion_matrix(donor_targets, donor_preds, os.path.join(args.output_dir, 'figures', 'confusion_matrix_donor.png'), title='Confusion Matrix (Donor-level)')
+                plot_pr_curve(donor_targets, donor_outputs, os.path.join(args.output_dir, 'figures', 'pr_curve_donor.png'), title='PR Curve (Donor-level)')
+                plot_output_distribution(donor_outputs, donor_targets, os.path.join(args.output_dir, 'figures', 'output_dist_donor.png'), class_names=['Short Survival', 'Long Survival'])
+
     # Plot training curves
     plt.figure(figsize=(10, 6))
     plt.plot(train_losses, label='Train Loss')
@@ -519,18 +990,79 @@ def main():
     plt.ylabel('Loss')
     plt.legend()
     plt.title('Training and Validation Loss')
-    plt.savefig(os.path.join(args.output_dir, 'loss_curve.png'))
+    plt.savefig(os.path.join(args.output_dir, 'figures', 'loss_curve.png'))
+    plt.close()
     
     plt.figure(figsize=(10, 6))
     plt.plot(val_aucs, label='Window-level AUC')
     if donor_aucs:
         plt.plot(donor_aucs, label='Donor-level AUC')
+    if len(val_aucs) == 1:
+        plt.scatter([0], val_aucs, color='blue')
+    if len(donor_aucs) == 1:
+        plt.scatter([0], donor_aucs, color='orange')
     plt.xlabel('Epoch')
     plt.ylabel('AUC')
     plt.legend()
     plt.title('Validation AUC')
-    plt.savefig(os.path.join(args.output_dir, 'auc_curve.png'))
+    plt.savefig(os.path.join(args.output_dir, 'figures', 'auc_curve.png'))
+    plt.close()
     
+    # Aggregate donor-level predictions for train and test
+    # For train
+    train_loader_full = DataLoader(
+        WindowDataset(window_generator.add_cls_tokens(window_generator.generate_windows(
+            data_dict['train_cells_normalized'], num_windows_per_sample=args.windows_per_sample))),
+        batch_size=args.batch_size, shuffle=False, collate_fn=collate_windows)
+    train_loss, train_outputs, train_targets, train_group_ids = 0, [], [], []
+    model.eval()
+    with torch.no_grad():
+        for batch in train_loader_full:
+            marker_values = batch['marker_values'].to(args.device)
+            rel_positions = batch['rel_positions'].to(args.device)
+            labels = batch['label'].to(args.device) if 'label' in batch else None
+            cell_types = batch['cell_types'].to(args.device) if 'cell_types' in batch else None
+            global_features = None
+            if global_features_dict is not None and 'group_id' in batch:
+                donors = [group_id[0] for group_id in batch['group_id']]
+                global_features = torch.tensor(
+                    np.array([global_features_dict[donor] for donor in donors]),
+                    dtype=torch.float32, device=args.device)
+            outputs = model(marker_values=marker_values, rel_positions=rel_positions, cell_types=cell_types, global_features=global_features)
+            train_outputs.extend(outputs.detach().cpu().numpy())
+            if labels is not None:
+                train_targets.extend(labels.detach().cpu().numpy())
+            if 'group_id' in batch:
+                train_group_ids.extend(batch['group_id'])
+    # For test
+    test_loader_full = DataLoader(
+        WindowDataset(window_generator.add_cls_tokens(window_generator.generate_windows(
+            data_dict['test_cells_normalized'], num_windows_per_sample=args.windows_per_sample))),
+        batch_size=args.batch_size, shuffle=False, collate_fn=collate_windows)
+    test_outputs, test_targets, test_group_ids = [], [], []
+    with torch.no_grad():
+        for batch in test_loader_full:
+            marker_values = batch['marker_values'].to(args.device)
+            rel_positions = batch['rel_positions'].to(args.device)
+            labels = batch['label'].to(args.device) if 'label' in batch else None
+            cell_types = batch['cell_types'].to(args.device) if 'cell_types' in batch else None
+            global_features = None
+            if global_features_dict is not None and 'group_id' in batch:
+                donors = [group_id[0] for group_id in batch['group_id']]
+                global_features = torch.tensor(
+                    np.array([global_features_dict[donor] for donor in donors]),
+                    dtype=torch.float32, device=args.device)
+            outputs = model(marker_values=marker_values, rel_positions=rel_positions, cell_types=cell_types, global_features=global_features)
+            test_outputs.extend(outputs.detach().cpu().numpy())
+            if labels is not None:
+                test_targets.extend(labels.detach().cpu().numpy())
+            if 'group_id' in batch:
+                test_group_ids.extend(batch['group_id'])
+    plot_donor_confusion_matrices(
+        np.array(train_outputs).ravel(), np.array(train_targets).ravel(), train_group_ids,
+        np.array(test_outputs).ravel(), np.array(test_targets).ravel(), test_group_ids,
+        os.path.join(args.output_dir, 'figures', 'donor_confusion_matrices.png'))
+
     print("Training complete!")
 
 if __name__ == "__main__":

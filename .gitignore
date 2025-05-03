@@ -25,3 +25,5 @@ evaluation_*.txt
 *.png
 *_metrics.txt
 *_analysis.png 
+.vscode/PythonImportHelper-v2-Completion.json
+.vscode/launch.json
