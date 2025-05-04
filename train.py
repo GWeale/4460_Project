@@ -13,6 +13,8 @@ from sklearn.decomposition import PCA
 import seaborn as sns
 import scanpy as sc
 import matplotlib
+from matplotlib.lines import Line2D
+from matplotlib.gridspec import GridSpec
 
 from data_prep import prepare_data, identify_feature_columns
 from model import SpatialBERTModel, WindowGenerator, WindowDataset, collate_windows
@@ -114,6 +116,84 @@ def prepare_global_features(metadata_df, args):
     
     return global_features_dict, global_feature_dim
 
+def plot_attention_weights(attention_weights, window_coords, cell_types, inv_cell_type_map, output_path, title="Attention Weights"):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import numpy as np
+    from matplotlib.gridspec import GridSpec
+    
+    # Convert tensors to numpy and ensure correct shapes
+    attention_weights = attention_weights.detach().cpu().numpy()
+    window_coords = window_coords.detach().cpu().numpy()
+    cell_types = cell_types.detach().cpu().numpy()
+    
+    # Debug prints
+    print(f"Attention weights shape: {attention_weights.shape}")
+    print(f"Window coords shape: {window_coords.shape}")
+    print(f"Cell types shape: {cell_types.shape}")
+    
+    num_heads = min(8, attention_weights.shape[0])  # Only plot first 8 heads
+    unique_types = np.unique(cell_types[1:len(window_coords)])
+    type_map = {t: i for i, t in enumerate(unique_types)}
+    mapped_types = np.array([type_map[t] for t in cell_types[1:len(window_coords)]])
+    
+    print(f"Plotting {num_heads} attention heads for window...")
+    
+    for h in range(num_heads):
+        # --- Spatial scatter with attention lines ---
+        fig = plt.figure(figsize=(7, 6))
+        gs = GridSpec(1, 20, figure=fig)
+        ax = fig.add_subplot(gs[0, :18])  # Main plot takes up 18/20 of the width
+        cbar_ax = fig.add_subplot(gs[0, 19])  # Colorbar takes up 1/20 of the width
+        
+        scatter = ax.scatter(window_coords[1:, 0], window_coords[1:, 1], c=mapped_types, cmap='tab20', alpha=0.6)
+        ax.scatter(window_coords[0, 0], window_coords[0, 1], c='red', marker='*', s=200, label='CLS')
+        
+        head_weights = attention_weights[h]
+        print(f"Head {h+1} weights shape: {head_weights.shape}")
+        
+        # Draw attention lines
+        for i in range(1, len(window_coords)):
+            for j in range(1, len(window_coords)):
+                if float(head_weights[i, j]) > 0.1:  # Convert to float for comparison
+                    ax.plot([window_coords[i, 0], window_coords[j, 0]],
+                            [window_coords[i, 1], window_coords[j, 1]],
+                            'k-', alpha=float(head_weights[i, j]), linewidth=1)
+        
+        # Draw CLS attention
+        for i in range(1, len(window_coords)):
+            if float(head_weights[0, i]) > 0.1:
+                ax.plot([window_coords[0, 0], window_coords[i, 0]],
+                        [window_coords[0, 1], window_coords[i, 1]],
+                        'r-', alpha=float(head_weights[0, i]), linewidth=1)
+            if float(head_weights[i, 0]) > 0.1:
+                ax.plot([window_coords[i, 0], window_coords[0, 0]],
+                        [window_coords[i, 1], window_coords[0, 1]],
+                        'b-', alpha=float(head_weights[i, 0]), linewidth=1)
+        
+        ax.set_title(f'Head {h+1} (spatial)')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        
+        # Add colorbar
+        cbar = fig.colorbar(scatter, cax=cbar_ax)
+        cbar.set_ticks(range(len(unique_types)))
+        cbar.set_ticklabels([inv_cell_type_map[t] for t in unique_types])
+        
+        plt.savefig(output_path.replace('.png', f'_head{h+1}_spatial.png'), bbox_inches='tight')
+        plt.close()
+        
+        # --- Separate attention heatmap for each head ---
+        fig_hm, ax_hm = plt.subplots(figsize=(6, 6))
+        sns.heatmap(head_weights, ax=ax_hm, cmap='viridis')
+        ax_hm.set_title(f'Head {h+1} (attention)')
+        ax_hm.set_xlabel('Token')
+        ax_hm.set_ylabel('Token')
+        plt.savefig(output_path.replace('.png', f'_head{h+1}_heatmap.png'), bbox_inches='tight')
+        plt.close()
+    
+    print("Done plotting attention heads.")
+
 def train_epoch(model, dataloader, optimizer, criterion, device, global_features_dict=None):
     """
     Train the model for one epoch
@@ -130,13 +210,15 @@ def train_epoch(model, dataloader, optimizer, criterion, device, global_features
     - loss: Average loss for the epoch
     - outputs: List of model outputs
     - targets: List of target labels
+    - attention_weights: Tuple of (attention_weights, coords, cell_types) for first window
     """
     model.train()
     total_loss = 0
     all_outputs = []
     all_targets = []
+    all_attention_weights = []
     
-    for batch in tqdm(dataloader, desc="Training", leave=False):
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training", leave=False)):
         # Move batch to device
         marker_values = batch['marker_values'].to(device)
         rel_positions = batch['rel_positions'].to(device)
@@ -146,7 +228,6 @@ def train_epoch(model, dataloader, optimizer, criterion, device, global_features
         # Prepare global features if used
         global_features = None
         if global_features_dict is not None and 'group_id' in batch:
-            # Extract donor from group_id (first element of tuple)
             donors = [group_id[0] for group_id in batch['group_id']]
             global_features = torch.tensor(
                 np.array([global_features_dict[donor] for donor in donors]),
@@ -155,11 +236,12 @@ def train_epoch(model, dataloader, optimizer, criterion, device, global_features
             )
         
         # Forward pass
-        outputs = model(
+        outputs, attention_weights = model(
             marker_values=marker_values, 
             rel_positions=rel_positions,
             cell_types=cell_types,
-            global_features=global_features
+            global_features=global_features,
+            return_attention=True
         )
         
         # Calculate loss
@@ -175,11 +257,19 @@ def train_epoch(model, dataloader, optimizer, criterion, device, global_features
         total_loss += loss.item()
         all_outputs.extend(outputs.detach().cpu().numpy())
         all_targets.extend(labels.detach().cpu().numpy())
+        
+        # Only store attention weights for first batch
+        if batch_idx == 0:
+            # Take first window from batch
+            first_window_attn = attention_weights[0].detach().cpu()  # shape: (num_heads, window_size, window_size)
+            first_window_coords = rel_positions[0].detach().cpu()  # shape: (window_size, 2)
+            first_window_types = cell_types[0].detach().cpu()  # shape: (window_size,)
+            all_attention_weights = (first_window_attn, first_window_coords, first_window_types)
     
     # Calculate average loss
     avg_loss = total_loss / len(dataloader)
     
-    return avg_loss, np.array(all_outputs), np.array(all_targets)
+    return avg_loss, np.array(all_outputs), np.array(all_targets), all_attention_weights
 
 def validate(model, dataloader, criterion, device, global_features_dict=None):
     """
@@ -196,15 +286,18 @@ def validate(model, dataloader, criterion, device, global_features_dict=None):
     - loss: Average loss for the validation set
     - outputs: List of model outputs
     - targets: List of target labels
+    - donor_metrics: Dict with donor-level metrics
+    - attention_weights: Tuple of (attention_weights, coords, cell_types) for first window
     """
     model.eval()
     total_loss = 0
     all_outputs = []
     all_targets = []
     all_group_ids = []
+    all_attention_weights = None
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validation", leave=False):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Validation", leave=False)):
             # Move batch to device
             marker_values = batch['marker_values'].to(device)
             rel_positions = batch['rel_positions'].to(device)
@@ -214,7 +307,6 @@ def validate(model, dataloader, criterion, device, global_features_dict=None):
             # Prepare global features if used
             global_features = None
             if global_features_dict is not None and 'group_id' in batch:
-                # Extract donor from group_id (first element of tuple)
                 donors = [group_id[0] for group_id in batch['group_id']]
                 global_features = torch.tensor(
                     np.array([global_features_dict[donor] for donor in donors]),
@@ -223,11 +315,12 @@ def validate(model, dataloader, criterion, device, global_features_dict=None):
                 )
             
             # Forward pass
-            outputs = model(
+            outputs, attention_weights = model(
                 marker_values=marker_values, 
                 rel_positions=rel_positions,
                 cell_types=cell_types,
-                global_features=global_features
+                global_features=global_features,
+                return_attention=True
             )
             
             # Calculate loss
@@ -240,11 +333,20 @@ def validate(model, dataloader, criterion, device, global_features_dict=None):
             
             if 'group_id' in batch:
                 all_group_ids.extend(batch['group_id'])
+            
+            # Only store attention weights for first batch
+            if batch_idx == 0:
+                # Take first window from batch
+                first_window_attn = attention_weights[0].detach().cpu()  # shape: (num_heads, window_size, window_size)
+                first_window_coords = rel_positions[0].detach().cpu()  # shape: (window_size, 2)
+                first_window_types = cell_types[0].detach().cpu()  # shape: (window_size,)
+                all_attention_weights = (first_window_attn, first_window_coords, first_window_types)
     
     # Calculate average loss
     avg_loss = total_loss / len(dataloader)
     
-    # If group_ids are available, we can aggregate predictions by sample
+    # Calculate donor-level metrics if group_ids are available
+    donor_metrics = None
     if all_group_ids:
         # Convert outputs and targets to numpy arrays
         outputs_np = np.array(all_outputs).squeeze()
@@ -266,23 +368,16 @@ def validate(model, dataloader, criterion, device, global_features_dict=None):
         # Calculate donor-level metrics
         donor_outputs = donor_df['output'].values
         donor_targets = donor_df['target'].values
-        
         donor_preds = (donor_outputs > 0).astype(int)
+        
         donor_metrics = {
+            'donor_auc': roc_auc_score(donor_targets, donor_outputs),
             'donor_accuracy': accuracy_score(donor_targets, donor_preds),
-            'donor_f1': f1_score(donor_targets, donor_preds, zero_division=0),
-            'donor_precision': precision_score(donor_targets, donor_preds, zero_division=0),
-            'donor_recall': recall_score(donor_targets, donor_preds, zero_division=0)
+            'donor_outputs': donor_outputs,
+            'donor_targets': donor_targets
         }
-        
-        if len(np.unique(donor_targets)) > 1:
-            donor_metrics['donor_auc'] = roc_auc_score(donor_targets, donor_outputs)
-        else:
-            donor_metrics['donor_auc'] = float('nan')
-        
-        return avg_loss, np.array(all_outputs), np.array(all_targets), donor_metrics
     
-    return avg_loss, np.array(all_outputs), np.array(all_targets), None
+    return avg_loss, np.array(all_outputs), np.array(all_targets), donor_metrics, all_attention_weights
 
 def calculate_metrics(outputs, targets):
     """
@@ -623,12 +718,16 @@ def plot_spatial_windows_with_survival(data_dict, train_windows, feature_columns
         else:
             pred_label = data_dict['train_cells'][data_dict['train_cells'][donor_col] == donor]['High_Survival'].iloc[0]
         color = 'red' if pred_label == 1 else 'blue'
-        label = 'Predicted Long Survival' if (i == 0 and pred_label == 1) else ('Predicted Short Survival' if (i == 0 and pred_label == 0) else None)
-        plt.scatter(center_coord[0], center_coord[1], c=color, alpha=0.5, s=200, marker='s', label=label)
+        plt.scatter(center_coord[0], center_coord[1], c=color, alpha=0.5, s=200, marker='s')
     plt.xlabel('X')
     plt.ylabel('Y')
     plt.title(f'Cells in Donor {donor} with Windows Overlayed by Predicted Survival')
-    plt.legend(loc='best', bbox_to_anchor=(1.05, 1), ncol=1)
+    # Custom legend: only red and blue squares
+    custom_legend = [
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='red', markersize=12, label='Predicted Long Survival'),
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='blue', markersize=12, label='Predicted Short Survival')
+    ]
+    plt.legend(handles=custom_legend, loc='upper right')
     plt.tight_layout()
     if epoch is not None:
         save_path = os.path.join(output_dir, f'spatial_windows_survival_epoch_{epoch}.png')
@@ -900,12 +999,12 @@ def main():
         print(f"Epoch {epoch+1}/{args.epochs}")
         
         # Train for one epoch
-        train_loss, train_outputs, train_targets = train_epoch(
+        train_loss, train_outputs, train_targets, train_attention_weights = train_epoch(
             model, train_loader, optimizer, criterion, args.device, global_features_dict
         )
         
         # Validate
-        val_loss, val_outputs, val_targets, donor_metrics = validate(
+        val_loss, val_outputs, val_targets, donor_metrics, val_attention_weights = validate(
             model, val_loader, criterion, args.device, global_features_dict
         )
         
@@ -983,9 +1082,7 @@ def main():
             donor_targets = np.array([v for v in donor_metrics.get('donor_targets', [])])
             if donor_outputs.size > 0 and donor_targets.size > 0:
                 donor_preds = (donor_outputs > 0).astype(int)
-                plot_roc_curve(donor_targets, donor_outputs, os.path.join(args.output_dir, 'figures', 'roc_curve_donor.png'), title='ROC Curve (Donor-level)')
                 plot_confusion_matrix(donor_targets, donor_preds, os.path.join(args.output_dir, 'figures', 'confusion_matrix_donor.png'), title='Confusion Matrix (Donor-level)', class_names=['Short Survival', 'Long Survival'])
-                plot_pr_curve(donor_targets, donor_outputs, os.path.join(args.output_dir, 'figures', 'pr_curve_donor.png'), title='PR Curve (Donor-level)')
                 plot_output_distribution(donor_outputs, donor_targets, os.path.join(args.output_dir, 'figures', 'output_dist_donor.png'), class_names=['Short Survival', 'Long Survival'])
 
         # After validation and after train_outputs are available, call:
@@ -993,6 +1090,30 @@ def main():
         plot_cell_density_heatmap(data_dict['train_cells'], os.path.join(args.output_dir, 'figures'), donor_id=donor_id)
         plot_grid_cell_density_histogram(data_dict['train_cells'], os.path.join(args.output_dir, 'figures'), donor_id=donor_id)
         plot_cell_type_prevalence_by_window_survival(train_windows, cell_type_map, os.path.join(args.output_dir, 'figures'))
+
+        # Training windows - only plot 1 window
+        if train_attention_weights is not None:
+            attn_weights, coords, types = train_attention_weights
+            plot_attention_weights(
+                attention_weights=attn_weights,
+                window_coords=coords,
+                cell_types=types,
+                inv_cell_type_map=inv_cell_type_map,
+                output_path=os.path.join(args.output_dir, 'figures', f'attention_weights_train_epoch_{epoch}_window_0.png'),
+                title=f'Training Attention Weights (Epoch {epoch}, Window 0)'
+            )
+
+        # Validation windows - only plot 1 window
+        if val_attention_weights is not None:
+            attn_weights, coords, types = val_attention_weights
+            plot_attention_weights(
+                attention_weights=attn_weights,
+                window_coords=coords,
+                cell_types=types,
+                inv_cell_type_map=inv_cell_type_map,
+                output_path=os.path.join(args.output_dir, 'figures', f'attention_weights_val_epoch_{epoch}_window_0.png'),
+                title=f'Validation Attention Weights (Epoch {epoch}, Window 0)'
+            )
 
     # Plot training curves
     plt.figure(figsize=(10, 6))
@@ -1040,7 +1161,7 @@ def main():
                 global_features = torch.tensor(
                     np.array([global_features_dict[donor] for donor in donors]),
                     dtype=torch.float32, device=args.device)
-            outputs = model(marker_values=marker_values, rel_positions=rel_positions, cell_types=cell_types, global_features=global_features)
+            outputs, _ = model(marker_values=marker_values, rel_positions=rel_positions, cell_types=cell_types, global_features=global_features)
             train_outputs.extend(outputs.detach().cpu().numpy())
             if labels is not None:
                 train_targets.extend(labels.detach().cpu().numpy())
@@ -1064,7 +1185,7 @@ def main():
                 global_features = torch.tensor(
                     np.array([global_features_dict[donor] for donor in donors]),
                     dtype=torch.float32, device=args.device)
-            outputs = model(marker_values=marker_values, rel_positions=rel_positions, cell_types=cell_types, global_features=global_features)
+            outputs, _ = model(marker_values=marker_values, rel_positions=rel_positions, cell_types=cell_types, global_features=global_features)
             test_outputs.extend(outputs.detach().cpu().numpy())
             if labels is not None:
                 test_targets.extend(labels.detach().cpu().numpy())

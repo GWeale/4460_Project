@@ -149,7 +149,7 @@ class SpatialBERTModel(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
         
-    def forward(self, marker_values, rel_positions, attention_mask=None, cell_types=None, global_features=None):
+    def forward(self, marker_values, rel_positions, attention_mask=None, cell_types=None, global_features=None, return_attention=True):
         """
         Forward pass through the model
         
@@ -159,9 +159,11 @@ class SpatialBERTModel(nn.Module):
         - attention_mask: attention mask for padding [batch_size, seq_len]
         - cell_types: tensor of cell type indices [batch_size, seq_len]
         - global_features: tensor of global features [batch_size, global_feature_dim]
+        - return_attention: whether to return attention weights
         
         Returns:
         - logits for binary classification [batch_size, 1]
+        - attention weights if return_attention is True
         """
         batch_size, seq_len = marker_values.shape[0], marker_values.shape[1]
         
@@ -197,6 +199,13 @@ class SpatialBERTModel(nn.Module):
             
         # Get prediction
         logits = self.prediction_head(combined_output)
+        
+        if return_attention:
+            # Get attention weights from the last layer
+            last_layer = self.transformer_encoder.layers[-1]
+            attn_weights = last_layer.self_attn(combined_embeddings, combined_embeddings, combined_embeddings,average_attn_weights=False)[1]
+            # attn_weights shape: [batch_size, num_heads, seq_len, seq_len]
+            return logits, attn_weights
         
         return logits
 

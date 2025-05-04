@@ -27,3 +27,4 @@ evaluation_*.txt
 *_analysis.png 
 .vscode/PythonImportHelper-v2-Completion.json
 .vscode/launch.json
+.cursor/env.mdc
