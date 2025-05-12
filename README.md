@@ -16,23 +16,10 @@ The model architecture combines local spatial information with global patient fe
 
 ## Requirements
 
-To run this code, you need:
-
-```
-python >= 3.8
-torch >= 1.8.0
-numpy
-pandas
-scikit-learn
-matplotlib
-seaborn
-tqdm
-```
-
-Install the requirements using:
+All dependencies and exact versions are listed in `requirements.txt`, generated from the current environment using `pip freeze`. To install:
 
 ```bash
-pip install torch numpy pandas scikit-learn matplotlib seaborn tqdm
+pip install -r requirements.txt
 ```
 
 ## Data Format
@@ -72,7 +59,9 @@ The data preparation pipeline in `data_prep.py` handles:
 - Identifying feature columns and cell types
 - Splitting data at the patient level
 - Optional batch correction
-- Feature normalization
+- Feature normalization (using a StandardScaler)
+
+**Note:** The fitted scaler is saved to `output/scaler.pkl` after training. This scaler is loaded in `evaluate.py` to ensure consistent normalization between training and evaluation.
 
 ### Training
 
@@ -93,18 +82,25 @@ Additional important parameters:
 # Windowing
 --k_neighbors 20                  # Number of neighbors per window
 --windows_per_sample 500          # Number of windows per sample
+--max_position 1000               # Maximum position value for positional encoding
 
 # Model
 --hidden_dim 256                  # Hidden dimension for model
 --num_heads 8                     # Number of attention heads
 --num_layers 6                    # Number of transformer layers
+--dropout 0.1                     # Dropout rate
 --use_global_features             # Use global features from metadata
 
 # Training
 --batch_size 32                   # Batch size
 --epochs 50                       # Number of epochs
 --lr 1e-4                         # Learning rate
+--weight_decay 1e-5               # Weight decay for optimizer
 --early_stopping 10               # Patience for early stopping
+--model_name spatial_bert         # Model name for checkpoint files
+--output_dir output               # Output directory
+--device cuda                     # Device to use (cuda or cpu)
+--seed 42                         # Random seed
 ```
 
 ### Evaluation

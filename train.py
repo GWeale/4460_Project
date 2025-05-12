@@ -15,6 +15,7 @@ import scanpy as sc
 import matplotlib
 from matplotlib.lines import Line2D
 from matplotlib.gridspec import GridSpec
+import pickle
 
 from data_prep import prepare_data, identify_feature_columns
 from model import SpatialBERTModel, WindowGenerator, WindowDataset, collate_windows
@@ -1250,6 +1251,12 @@ def main():
         os.path.join(args.output_dir, 'figures', 'donor_confusion_matrices.png'))
 
     print("Training complete!")
+
+    # Save the fitted scaler for use in evaluation
+    scaler_path = os.path.join('evaluation', 'scaler.pkl')
+    with open(scaler_path, 'wb') as f:
+        pickle.dump(data_dict['scaler'], f)
+    print(f"Scaler saved to {scaler_path}")
 
 if __name__ == "__main__":
     main() 

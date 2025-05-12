@@ -7,6 +7,8 @@ from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, precision_s
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
+import time
+import pickle
 
 from data_prep import prepare_data
 from model import SpatialBERTModel, WindowGenerator, WindowDataset, collate_windows
@@ -41,6 +43,21 @@ def load_model(model_path, device):
     - model: Loaded model
     - args: Arguments used for training
     """
+    # Print checkpoint file creation time and age
+    ctime = os.path.getctime(model_path)
+    ctime_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ctime))
+    age_sec = time.time() - ctime
+    if age_sec < 60:
+        age_str = f"{int(age_sec)} seconds"
+    elif age_sec < 3600:
+        age_str = f"{int(age_sec//60)} minutes"
+    elif age_sec < 86400:
+        age_str = f"{int(age_sec//3600)} hours"
+    else:
+        age_str = f"{int(age_sec//86400)} days"
+    print(f"Model checkpoint: {model_path}")
+    print(f"  Created: {ctime_str} ({age_str} ago)")
+    
     # Load checkpoint
     checkpoint = torch.load(model_path, map_location=device)
     
@@ -186,6 +203,9 @@ def evaluate_model(model, dataloader, device, global_features_dict=None):
                 cell_types=cell_types,
                 global_features=global_features
             )
+            # If model returns (outputs, attn), just use outputs
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
             
             # Store outputs and targets
             all_outputs.extend(outputs.cpu().numpy())
@@ -333,6 +353,19 @@ def main():
         os_threshold=train_args.os_threshold if hasattr(train_args, 'os_threshold') else None,
         apply_batch_corr=train_args.apply_batch_corr if hasattr(train_args, 'apply_batch_corr') else False
     )
+    
+    # Load the scaler from disk (trained on train set)
+    scaler_path = os.path.join(args.output_dir, 'scaler.pkl')
+    with open(scaler_path, 'rb') as f:
+        scaler = pickle.load(f)
+    print(f"Loaded scaler from {scaler_path}")
+    # Use this scaler to normalize all splits
+    feature_columns = data_dict['feature_columns']
+    for split in ['train', 'val', 'test']:
+        data_dict[f'{split}_cells_normalized'] = data_dict[f'{split}_cells'].copy()
+        data_dict[f'{split}_cells_normalized'][feature_columns['markers']] = scaler.transform(
+            data_dict[f'{split}_cells'][feature_columns['markers']]
+        )
     
     # Prepare global features if needed
     global_features_dict, global_feature_dim = prepare_global_features(
