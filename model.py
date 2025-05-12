@@ -374,9 +374,18 @@ class WindowGenerator:
         
         # Generate windows for each sample
         for group_id, sample_df in tqdm(grouped, desc="Generating windows"):
+            # Get survival label for this sample
+            survival_label = sample_df['High_Survival'].iloc[0]
+            
+            # For long survival samples, generate 5x more windows
+            if survival_label == 1:
+                num_windows = num_windows_per_sample * 4 if num_windows_per_sample is not None else None
+            else:
+                num_windows = num_windows_per_sample
+            
             window_data = self._generate_windows_for_sample(
                 sample_df, 
-                num_windows=num_windows_per_sample
+                num_windows=num_windows
             )
             
             # Store results

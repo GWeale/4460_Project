@@ -152,24 +152,28 @@ def plot_attention_weights(attention_weights, window_coords, cell_types, inv_cel
         head_weights = attention_weights[h]
         print(f"Head {h+1} weights shape: {head_weights.shape}")
         
+        # Normalize attention weights to [0, 1] range for each row
+        row_sums = head_weights.sum(axis=1, keepdims=True)
+        normalized_weights = np.divide(head_weights, row_sums, out=np.zeros_like(head_weights), where=row_sums!=0)
+        
         # Draw attention lines
         for i in range(1, len(window_coords)):
             for j in range(1, len(window_coords)):
-                if float(head_weights[i, j]) > 0.1:  # Convert to float for comparison
+                if normalized_weights[i, j] > 0.1:  # Only draw significant attention
                     ax.plot([window_coords[i, 0], window_coords[j, 0]],
                             [window_coords[i, 1], window_coords[j, 1]],
-                            'k-', alpha=float(head_weights[i, j]), linewidth=1)
+                            'k-', alpha=min(normalized_weights[i, j], 1.0), linewidth=1)
         
         # Draw CLS attention
         for i in range(1, len(window_coords)):
-            if float(head_weights[0, i]) > 0.1:
+            if normalized_weights[0, i] > 0.1:
                 ax.plot([window_coords[0, 0], window_coords[i, 0]],
                         [window_coords[0, 1], window_coords[i, 1]],
-                        'r-', alpha=float(head_weights[0, i]), linewidth=1)
-            if float(head_weights[i, 0]) > 0.1:
+                        'r-', alpha=min(normalized_weights[0, i], 1.0), linewidth=1)
+            if normalized_weights[i, 0] > 0.1:
                 ax.plot([window_coords[i, 0], window_coords[0, 0]],
                         [window_coords[i, 1], window_coords[0, 1]],
-                        'b-', alpha=float(head_weights[i, 0]), linewidth=1)
+                        'b-', alpha=min(normalized_weights[i, 0], 1.0), linewidth=1)
         
         ax.set_title(f'Head {h+1} (spatial)')
         ax.set_xlabel('X')
@@ -185,7 +189,7 @@ def plot_attention_weights(attention_weights, window_coords, cell_types, inv_cel
         
         # --- Separate attention heatmap for each head ---
         fig_hm, ax_hm = plt.subplots(figsize=(6, 6))
-        sns.heatmap(head_weights, ax=ax_hm, cmap='viridis')
+        sns.heatmap(normalized_weights, ax=ax_hm, cmap='viridis')
         ax_hm.set_title(f'Head {h+1} (attention)')
         ax_hm.set_xlabel('Token')
         ax_hm.set_ylabel('Token')
@@ -194,7 +198,7 @@ def plot_attention_weights(attention_weights, window_coords, cell_types, inv_cel
     
     print("Done plotting attention heads.")
 
-def train_epoch(model, dataloader, optimizer, criterion, device, global_features_dict=None):
+def train_epoch(model, dataloader, optimizer, criterion, device, global_features_dict=None, val_loader=None, val_steps=70):
     """
     Train the model for one epoch
     
@@ -205,11 +209,14 @@ def train_epoch(model, dataloader, optimizer, criterion, device, global_features
     - criterion: Loss function
     - device: Device to use
     - global_features_dict: Dict mapping donor to global features
+    - val_loader: Optional validation dataloader for step-wise validation
+    - val_steps: Number of training steps between validations
     
     Returns:
-    - loss: Average loss for the epoch
-    - outputs: List of model outputs
-    - targets: List of target labels
+    - step_train_losses: dict mapping step_num to train loss
+    - step_val_losses: dict mapping step_num to val loss
+    - train_outputs: List of model outputs
+    - train_targets: List of target labels
     - attention_weights: Tuple of (attention_weights, coords, cell_types) for first window
     """
     model.train()
@@ -217,6 +224,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device, global_features
     all_outputs = []
     all_targets = []
     all_attention_weights = []
+    step_train_losses = {}  # step_num: loss
+    step_val_losses = {}    # step_num: val_loss
+    step_counter = 0
     
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training", leave=False)):
         # Move batch to device
@@ -255,21 +265,55 @@ def train_epoch(model, dataloader, optimizer, criterion, device, global_features
         
         # Track loss and predictions
         total_loss += loss.item()
+        step_train_losses[step_counter] = loss.item()
         all_outputs.extend(outputs.detach().cpu().numpy())
         all_targets.extend(labels.detach().cpu().numpy())
         
         # Only store attention weights for first batch
         if batch_idx == 0:
-            # Take first window from batch
-            first_window_attn = attention_weights[0].detach().cpu()  # shape: (num_heads, window_size, window_size)
-            first_window_coords = rel_positions[0].detach().cpu()  # shape: (window_size, 2)
-            first_window_types = cell_types[0].detach().cpu()  # shape: (window_size,)
+            first_window_attn = attention_weights[0].detach().cpu()
+            first_window_coords = rel_positions[0].detach().cpu()
+            first_window_types = cell_types[0].detach().cpu()
             all_attention_weights = (first_window_attn, first_window_coords, first_window_types)
+        
+        step_counter += 1
+        
+        # Run validation every val_steps
+        if val_loader is not None and step_counter % val_steps == 0:
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    val_marker_values = val_batch['marker_values'].to(device)
+                    val_rel_positions = val_batch['rel_positions'].to(device)
+                    val_labels = val_batch['label'].to(device) if 'label' in val_batch else None
+                    val_cell_types = val_batch['cell_types'].to(device) if 'cell_types' in val_batch else None
+                    
+                    val_global_features = None
+                    if global_features_dict is not None and 'group_id' in val_batch:
+                        val_donors = [group_id[0] for group_id in val_batch['group_id']]
+                        val_global_features = torch.tensor(
+                            np.array([global_features_dict[donor] for donor in val_donors]),
+                            dtype=torch.float32,
+                            device=device
+                        )
+                    
+                    val_outputs, _ = model(
+                        marker_values=val_marker_values,
+                        rel_positions=val_rel_positions,
+                        cell_types=val_cell_types,
+                        global_features=val_global_features
+                    )
+                    val_loss += criterion(val_outputs.squeeze(), val_labels).item()
+            
+            val_loss /= len(val_loader)
+            step_val_losses[step_counter] = val_loss
+            model.train()
     
     # Calculate average loss
     avg_loss = total_loss / len(dataloader)
     
-    return avg_loss, np.array(all_outputs), np.array(all_targets), all_attention_weights
+    return avg_loss, step_train_losses, step_val_losses, np.array(all_outputs), np.array(all_targets), all_attention_weights
 
 def validate(model, dataloader, criterion, device, global_features_dict=None):
     """
@@ -990,39 +1034,48 @@ def main():
     patience_counter = 0
     
     # Lists to store metrics
-    train_losses = []
-    val_losses = []
+    all_train_losses = {}  # step_num: loss
+    all_val_losses = {}    # step_num: val_loss
     val_aucs = []
     donor_aucs = []
     
     for epoch in range(args.epochs):
         print(f"Epoch {epoch+1}/{args.epochs}")
         
-        # Train for one epoch
-        train_loss, train_outputs, train_targets, train_attention_weights = train_epoch(
-            model, train_loader, optimizer, criterion, args.device, global_features_dict
+        # Train for one epoch with step-wise validation
+        train_loss, step_train_losses, step_val_losses, train_outputs, train_targets, train_attention_weights = train_epoch(
+            model, train_loader, optimizer, criterion, args.device, global_features_dict, val_loader, val_steps=70
         )
         
-        # Validate
+        # Store step-wise losses
+        all_train_losses.update(step_train_losses)
+        all_val_losses.update(step_val_losses)
+        
+        # Calculate metrics for the epoch
+        train_metrics = calculate_metrics(train_outputs, train_targets)
+        
+        # Get final validation metrics for the epoch
         val_loss, val_outputs, val_targets, donor_metrics, val_attention_weights = validate(
             model, val_loader, criterion, args.device, global_features_dict
         )
-        
-        # Calculate metrics
-        train_metrics = calculate_metrics(train_outputs, train_targets)
         val_metrics = calculate_metrics(val_outputs, val_targets)
         
         # Store metrics
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
         val_aucs.append(val_metrics['auc'])
-        
         if donor_metrics is not None:
             donor_aucs.append(donor_metrics['donor_auc'])
         
         # Print metrics
         print(f"Train loss: {train_loss:.4f}, Train AUC: {train_metrics['auc']:.4f}")
         print(f"Val loss: {val_loss:.4f}, Val AUC: {val_metrics['auc']:.4f}")
+        print(f'Train accuracy: {train_metrics["accuracy"]}')
+        print(f'Val accuracy: {val_metrics["accuracy"]}')
+        print(f'Val f1: {val_metrics["f1"]}')
+        print(f'Train f1: {train_metrics["f1"]}')
+        print(f'Val precision: {val_metrics["precision"]}')
+        print(f'Train precision: {train_metrics["precision"]}')
+        print(f'Val recall: {val_metrics["recall"]}')
+        print(f'Train recall: {train_metrics["recall"]}')
         
         if donor_metrics is not None:
             print(f"Donor AUC: {donor_metrics['donor_auc']:.4f}, "
@@ -1115,15 +1168,15 @@ def main():
                 title=f'Validation Attention Weights (Epoch {epoch}, Window 0)'
             )
 
-    # Plot training curves
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.xlabel('Epoch')
+    # Plot step-wise training curves
+    plt.figure(figsize=(15, 6))
+    plt.plot(list(all_train_losses.keys()), list(all_train_losses.values()), label='Train Loss', alpha=0.6)
+    plt.scatter(list(all_val_losses.keys()), list(all_val_losses.values()), label='Val Loss', color='orange')
+    plt.xlabel('Training Steps')
     plt.ylabel('Loss')
     plt.legend()
-    plt.title('Training and Validation Loss')
-    plt.savefig(os.path.join(args.output_dir, 'figures', 'loss_curve.png'))
+    plt.title('Training and Validation Loss (Step-wise)')
+    plt.savefig(os.path.join(args.output_dir, 'figures', 'stepwise_loss_curve.png'))
     plt.close()
     
     plt.figure(figsize=(10, 6))
